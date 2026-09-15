@@ -1,0 +1,743 @@
+#############################################################
+# PERSON-FIT STATISTICS UNDER THE 3PL MODEL
+#
+# Indices:
+#   lz*
+#   U*
+#   W*
+#   ECI_Z2*
+#   ECI_Z4*
+#   Ht
+
+#############################################################
+
+
+# ============================================================
+# NEEDED PACKAGES
+# ============================================================
+
+library(ltm)
+library(irtoys)
+library(PerFit)
+library(aberrance)
+
+
+# ============================================================
+# 1. COMPARE THE 2PL AND 3PL MODELS WITH LTM
+# ============================================================
+# This is a relative-fit comparison. Smaller AIC and BIC values
+# indicate the preferred model among the two candidates.
+# A likelihood-ratio p-value is not used here because the 2PL
+# is obtained when the 3PL guessing parameters are on a boundary.
+
+X_data <- as.data.frame(X)
+
+fit_2PL_ltm <- ltm::ltm(
+  X_data ~ z1,
+  IRT.param = TRUE
+)
+
+fit_3PL_ltm <- ltm::tpm(
+  X_data,
+  type = "latent.trait",
+  IRT.param = TRUE
+)
+
+model_comparison <- data.frame(
+  Model = c("2PL", "3PL"),
+  Log_likelihood = c(
+    as.numeric(logLik(fit_2PL_ltm)),
+    as.numeric(logLik(fit_3PL_ltm))
+  ),
+  N_parameters = c(
+    attr(logLik(fit_2PL_ltm), "df"),
+    attr(logLik(fit_3PL_ltm), "df")
+  ),
+  AIC = c(
+    AIC(fit_2PL_ltm),
+    AIC(fit_3PL_ltm)
+  ),
+  BIC = c(
+    BIC(fit_2PL_ltm),
+    BIC(fit_3PL_ltm)
+  )
+)
+
+model_comparison$Delta_AIC <-
+  model_comparison$AIC - min(model_comparison$AIC)
+
+model_comparison$Delta_BIC <-
+  model_comparison$BIC - min(model_comparison$BIC)
+
+model_comparison$Preferred_by_AIC <-
+  model_comparison$AIC == min(model_comparison$AIC)
+
+model_comparison$Preferred_by_BIC <-
+  model_comparison$BIC == min(model_comparison$BIC)
+
+print(model_comparison)
+
+cat(
+  "\nPreferred model according to AIC:",
+  model_comparison$Model[which.min(model_comparison$AIC)],
+  "\n"
+)
+
+cat(
+  "Preferred model according to BIC:",
+  model_comparison$Model[which.min(model_comparison$BIC)],
+  "\n"
+)
+
+
+# ============================================================
+# 2. ESTIMATE 3PL ITEM PARAMETERS WITH IRTOYS/LTM
+# ============================================================
+
+
+set.seed(123)
+
+fit_3PL <- irtoys::est(
+  resp = X,
+  model = "3PL",
+  engine = "ltm"
+)
+
+IP_3PL <- as.matrix(fit_3PL$est)
+
+if (ncol(IP_3PL) != 3L) {
+  stop("The item-parameter matrix does not contain three columns.")
+}
+
+colnames(IP_3PL) <- c("a", "b", "c")
+
+if (!is.null(colnames(X))) {
+  rownames(IP_3PL) <- colnames(X)
+}
+
+if (anyNA(IP_3PL) || any(!is.finite(IP_3PL))) {
+  stop(
+    paste0(
+      "The 3PL calibration returned missing or non-finite item parameters. ",
+      "Inspect fit_3PL and consider whether the 3PL is stable for these data."
+    )
+  )
+}
+
+print(head(IP_3PL))
+
+
+# ============================================================
+# 3. ESTIMATE THETA BY WEIGHTED LIKELIHOOD
+# ============================================================
+
+theta_object <- irtoys::wle(
+  resp = X,
+  ip = IP_3PL
+)
+
+theta_WL <- as.numeric(theta_object[, 1])
+
+if (length(theta_WL) != nrow(X)) {
+  stop("The number of theta estimates does not equal the number of persons.")
+}
+
+if (anyNA(theta_WL) || any(!is.finite(theta_WL))) {
+  warning(
+    "Some WL ability estimates are missing or non-finite. ",
+    "The corresponding person-fit values may also be missing."
+  )
+}
+
+xi_3PL <- matrix(
+  theta_WL,
+  ncol = 1,
+  dimnames = list(rownames(X), "theta")
+)
+
+
+# ============================================================
+# 4. FUNCTIONS TO COMPUTE U* AND W*
+# ============================================================
+
+Pi_3PL <- function(theta, item_parameters) {
+
+  a <- item_parameters[, 1]
+  b <- item_parameters[, 2]
+  c <- item_parameters[, 3]
+
+  logistic_part <- plogis(a * (theta - b))
+
+  probability <- c + (1 - c) * logistic_part
+
+  first_derivative <-
+    (1 - c) *
+    a *
+    logistic_part *
+    (1 - logistic_part)
+
+  second_derivative <-
+    (1 - c) *
+    a^2 *
+    logistic_part *
+    (1 - logistic_part) *
+    (1 - 2 * logistic_part)
+
+  probability <- pmin(
+    pmax(probability, 1e-10),
+    1 - 1e-10
+  )
+
+  list(
+    Pi = probability,
+    dPi = first_derivative,
+    d2Pi = second_derivative
+  )
+}
+
+
+ri_3PL <- function(theta, item_parameters) {
+
+  values <- Pi_3PL(theta, item_parameters)
+
+  values$dPi /
+    (values$Pi * (1 - values$Pi))
+}
+
+
+r0_WL <- function(theta, item_parameters) {
+
+  values <- Pi_3PL(theta, item_parameters)
+  r_values <- ri_3PL(theta, item_parameters)
+
+  denominator <- 2 * sum(r_values * values$dPi)
+
+  if (!is.finite(denominator) || abs(denominator) < 1e-12) {
+    return(NA_real_)
+  }
+
+  sum(r_values * values$d2Pi) / denominator
+}
+
+
+item_weights <- function(theta, item_parameters, index) {
+
+  index <- match.arg(index, c("lz", "U", "W"))
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+  J <- nrow(item_parameters)
+
+  switch(
+    index,
+
+    lz = log(probability / (1 - probability)),
+
+    U = (1 - 2 * probability) /
+      (J * probability * (1 - probability)),
+
+    W = (1 - 2 * probability) /
+      sum(probability * (1 - probability))
+  )
+}
+
+
+Wn <- function(response_vector, theta, item_parameters, index) {
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+
+  weights <- item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  sum((response_vector - probability) * weights)
+}
+
+
+cn <- function(theta, item_parameters, index) {
+
+  values <- Pi_3PL(theta, item_parameters)
+
+  weights <- item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  numerator <- sum(values$dPi * weights)
+  denominator <- sum(values$dPi * ri_3PL(theta, item_parameters))
+
+  if (!is.finite(denominator) || abs(denominator) < 1e-12) {
+    return(NA_real_)
+  }
+
+  numerator / denominator
+}
+
+
+corrected_weights <- function(theta, item_parameters, index) {
+
+  correction <- cn(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  if (!is.finite(correction)) {
+    return(rep(NA_real_, nrow(item_parameters)))
+  }
+
+  item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  ) -
+    correction * ri_3PL(theta, item_parameters)
+}
+
+
+tau2n <- function(theta, item_parameters, index) {
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+
+  weights <- corrected_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  if (anyNA(weights)) {
+    return(NA_real_)
+  }
+
+  sum(
+    weights^2 *
+      probability *
+      (1 - probability)
+  ) / nrow(item_parameters)
+}
+
+
+compute_corrected_index <- function(
+    data,
+    item_parameters,
+    theta,
+    index = c("U", "W")) {
+
+  index <- match.arg(index)
+
+  corrected_index <- rep(NA_real_, nrow(data))
+
+  for (person in seq_len(nrow(data))) {
+
+    th <- theta[person]
+
+    if (!is.finite(th)) {
+      next
+    }
+
+    correction_c <- cn(
+      theta = th,
+      item_parameters = item_parameters,
+      index = index
+    )
+
+    bias_WL <- r0_WL(
+      theta = th,
+      item_parameters = item_parameters
+    )
+
+    expected_corrected <- -correction_c * bias_WL
+
+    variance_corrected <-
+      nrow(item_parameters) *
+      tau2n(
+        theta = th,
+        item_parameters = item_parameters,
+        index = index
+      )
+
+    observed_value <- Wn(
+      response_vector = data[person, ],
+      theta = th,
+      item_parameters = item_parameters,
+      index = index
+    )
+
+    if (
+      is.finite(expected_corrected) &&
+      is.finite(variance_corrected) &&
+      variance_corrected > 0
+    ) {
+      corrected_index[person] <-
+        (observed_value - expected_corrected) /
+        sqrt(variance_corrected)
+    }
+  }
+
+  corrected_index
+}
+
+
+# ============================================================
+# 5. COMPUTE lz* FROM PERFIT
+# ============================================================
+
+result_lzstar <- PerFit::lzstar(
+  matrix = X,
+  IP = IP_3PL,
+  IRT.PModel = "3PL",
+  Ability = theta_WL,
+  Ability.PModel = "WL"
+)
+
+lzstar_scores <- as.numeric(
+  unlist(result_lzstar$PFscores)
+)
+
+
+# ============================================================
+# 6. COMPUTE Ht FROM PERFIT
+# ============================================================
+
+result_Ht <- PerFit::Ht(
+  matrix = X
+)
+
+Ht_scores <- as.numeric(
+  unlist(result_Ht$PFscores)
+)
+
+
+# ============================================================
+# 7. COMPUTE ECI_Z2* AND ECI_Z4* FROM ABERRANT
+# ============================================================
+
+result_ECI <- aberrance::detect_pm(
+  method = c(
+    "ECI2_S_TS",
+    "ECI4_S_TS"
+  ),
+  psi = IP_3PL,
+  xi = xi_3PL,
+  x = X,
+  alpha = 0.05
+)
+
+ECI_Z2_star <- as.numeric(
+  result_ECI$stat[, "ECI2_S_TS"]
+)
+
+ECI_Z4_star <- as.numeric(
+  result_ECI$stat[, "ECI4_S_TS"]
+)
+
+
+# ============================================================
+# 8. COMPUTE U* AND W* FROM PERSONAL R CODE
+# ============================================================
+
+U_star_scores <- compute_corrected_index(
+  data = X,
+  item_parameters = IP_3PL,
+  theta = theta_WL,
+  index = "U"
+)
+
+W_star_scores <- compute_corrected_index(
+  data = X,
+  item_parameters = IP_3PL,
+  theta = theta_WL,
+  index = "W"
+)
+
+
+# ============================================================
+# 9. COMBINE RESULTS
+# ============================================================
+
+if (
+  exists("Person_ID", inherits = TRUE) &&
+  length(Person_ID) == nrow(X)
+) {
+  respondent_ID <- Person_ID
+} else if (!is.null(rownames(X))) {
+  respondent_ID <- rownames(X)
+} else {
+  respondent_ID <- seq_len(nrow(X))
+}
+
+person_fit_results <- data.frame(
+  Person = respondent_ID,
+  theta_WL = theta_WL,
+  lzstar = lzstar_scores,
+  U_star = U_star_scores,
+  W_star = W_star_scores,
+  ECI_Z2_star = ECI_Z2_star,
+  ECI_Z4_star = ECI_Z4_star,
+  Ht = Ht_scores,
+  check.names = FALSE
+)
+
+print(head(person_fit_results))
+
+
+# ============================================================
+# 10. FLAGGING AT THE 5% LEVEL
+# ============================================================
+
+alpha <- 0.05
+normal_cutoff <- qnorm(alpha)
+
+person_fit_results$lzstar_flag <-
+  person_fit_results$lzstar < normal_cutoff
+
+person_fit_results$U_star_flag <-
+  person_fit_results$U_star < normal_cutoff
+
+person_fit_results$W_star_flag <-
+  person_fit_results$W_star < normal_cutoff
+
+person_fit_results$ECI_Z2_star_flag <-
+  person_fit_results$ECI_Z2_star < normal_cutoff
+
+person_fit_results$ECI_Z4_star_flag <-
+  person_fit_results$ECI_Z4_star < normal_cutoff
+
+
+# Ht uses a simulated empirical cutoff.
+set.seed(123)
+
+Ht_cutoff_object <- PerFit::cutoff(
+  x = result_Ht,
+  ModelFit = "NonParametric",
+  Nreps = 1000,
+  Blvl = alpha,
+  Breps = 1000
+)
+
+Ht_cutoff <- as.numeric(Ht_cutoff_object$Cutoff)[1]
+
+person_fit_results$Ht_flag <-
+  person_fit_results$Ht <= Ht_cutoff
+
+
+# ============================================================
+# 11. FLAGGING SUMMARY
+# ============================================================
+
+score_names <- c(
+  "lzstar",
+  "U_star",
+  "W_star",
+  "ECI_Z2_star",
+  "ECI_Z4_star",
+  "Ht"
+)
+
+flag_names <- paste0(score_names, "_flag")
+
+flag_summary <- data.frame(
+  Index = c(
+    "lz*",
+    "U*",
+    "W*",
+    "ECI_Z2*",
+    "ECI_Z4*",
+    "Ht"
+  ),
+  N_valid = vapply(
+    person_fit_results[score_names],
+    function(z) sum(!is.na(z)),
+    FUN.VALUE = integer(1)
+  ),
+  N_flagged = vapply(
+    person_fit_results[flag_names],
+    function(z) sum(z, na.rm = TRUE),
+    FUN.VALUE = integer(1)
+  )
+)
+
+flag_summary$Percent_flagged <- round(
+  100 * flag_summary$N_flagged / flag_summary$N_valid,
+  2
+)
+
+print(flag_summary)
+
+# ============================================================
+# 12. EMPIRICAL DESCRIPTIVE STATISTICS
+# ============================================================
+# These summaries describe the observed distribution of each
+# person-fit index in the current dataset.
+
+index_labels <- c(
+  lzstar = "lz*",
+  U_star = "U*",
+  W_star = "W*",
+  ECI_Z2_star = "ECI_Z2*",
+  ECI_Z4_star = "ECI_Z4*",
+  Ht = "Ht"
+)
+
+empirical_skewness <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) < 3L || sd(x) == 0) {
+    return(NA_real_)
+  }
+
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+empirical_excess_kurtosis <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) < 4L || sd(x) == 0) {
+    return(NA_real_)
+  }
+
+  mean((x - mean(x))^4) / sd(x)^4 - 3
+}
+
+descriptive_statistics <- do.call(
+  rbind,
+  lapply(score_names, function(index_name) {
+
+    values <- person_fit_results[[index_name]]
+    values <- values[is.finite(values)]
+
+    data.frame(
+      Index = unname(index_labels[index_name]),
+      N_valid = length(values),
+      Mean = mean(values),
+      SD = sd(values),
+      Minimum = min(values),
+      Q1 = unname(quantile(values, 0.25)),
+      Median = median(values),
+      Q3 = unname(quantile(values, 0.75)),
+      Maximum = max(values),
+      Skewness = empirical_skewness(values),
+      Excess_kurtosis = empirical_excess_kurtosis(values),
+      row.names = NULL
+    )
+  })
+)
+
+print(descriptive_statistics)
+
+
+# ============================================================
+# 13. EMPIRICAL QUANTILES OF THE DISTRIBUTIONS
+# ============================================================
+
+quantile_probabilities <- c(
+  0.01,
+  0.05,
+  0.10,
+  0.25,
+  0.50,
+  0.75,
+  0.90,
+  0.95,
+  0.99
+)
+
+distribution_quantiles <- do.call(
+  rbind,
+  lapply(score_names, function(index_name) {
+
+    values <- person_fit_results[[index_name]]
+    values <- values[is.finite(values)]
+
+    quantile_values <- quantile(
+      values,
+      probs = quantile_probabilities,
+      names = FALSE,
+      type = 7
+    )
+
+    data.frame(
+      Index = unname(index_labels[index_name]),
+      Percentile = 100 * quantile_probabilities,
+      Empirical_value = as.numeric(quantile_values),
+      row.names = NULL
+    )
+  })
+)
+
+print(distribution_quantiles)
+
+
+# ============================================================
+# 14. HISTOGRAMS AND EMPIRICAL DENSITY CURVES
+# ============================================================
+# A PDF containing one distribution plot for each index is saved
+# in the current working directory.
+
+distribution_plot_file <- file.path(
+  getwd(),
+  "person_fit_empirical_distributions.pdf"
+)
+
+pdf(
+  file = distribution_plot_file,
+  width = 8,
+  height = 6
+)
+
+for (index_name in score_names) {
+
+  values <- person_fit_results[[index_name]]
+  values <- values[is.finite(values)]
+
+  hist(
+    values,
+    breaks = "FD",
+    probability = TRUE,
+    main = paste(
+      "Empirical distribution of",
+      unname(index_labels[index_name])
+    ),
+    xlab = unname(index_labels[index_name]),
+    ylab = "Density"
+  )
+
+  if (length(unique(values)) > 1L) {
+    lines(
+      density(values),
+      lwd = 2
+    )
+  }
+
+  abline(
+    v = mean(values),
+    lty = 2,
+    lwd = 2
+  )
+
+  abline(
+    v = median(values),
+    lty = 3,
+    lwd = 2
+  )
+
+  legend(
+    "topright",
+    legend = c("Mean", "Median"),
+    lty = c(2, 3),
+    lwd = c(2, 2),
+    bty = "n"
+  )
+}
+
+dev.off()
+
+cat(
+  "\nDistribution plots saved to:\n",
+  distribution_plot_file,
+  "\n"
+)
+
+# The end :-)

@@ -1,0 +1,922 @@
+---
+title: "Person Fit Across 1PL, 2PL and 3PL: Bootstrap-Calibrated Flagging on IRW Tables"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    code-fold: show
+    df-print: kable
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+This page reports a revised person-fit pipeline run on `r nrow(readRDS("persondata_v2/manifest.rds"))` [Item Response Warehouse](https://itemresponsewarehouse.org/) (IRW) tables. The engine is `analyze_irw_personfit()` in [`IRW_personfit_Sept14092026.R`](IRW_personfit_Sept14092026.R); the IRW harness is [`person_fit_v2_compute.R`](person_fit_v2_compute.R). This page only loads cached results from `persondata_v2/`.
+
+**What changed since the 10 September version** (archived in `archive_v2_sept10/`), in response to collaborator feedback:
+
+1. **Absolute fit.** AIC/BIC are complemented by M2, RMSEA and SRMSR, so the working model is checked for acceptable fit, not only for being the best of three (Section 2).
+2. **Faceted flagging summaries.** Flagging rates are shown as functions of test length, sample size, working model, analysis model and index (Section 3).
+3. **Empirical critical values.** The bootstrap distributions supply calibrated cutoffs, and respondents are reflagged against them (Section 4).
+4. **Ability-conditional calibration.** The same critical values are derived within ability quintiles, and we ask whether flagging becomes flat across θ (Section 5).
+
+Two further changes: the run now draws on the 18 tables that calibrated in the July pilot rather than four (test length and sample size need spread to be facets at all), and the bootstrap rescored every replicate under **all three** analysis models rather than only the working model, so every model × index combination has its own critical values. The score correlations, distribution moments and agreement statistics that were Sections 5–7 are now in the Supplement.
+
+**Terminology.** The *working model* is the model chosen by BIC for a table; it generates the bootstrap data. The *analysis model* is the model under which person-fit scores are computed. Three flagging *methods* are compared throughout:
+
+| Method | Cutoff |
+|---|---|
+| Normal theory | $\Phi^{-1}(\alpha)$ (upper tail, $\Phi^{-1}(1-\alpha)$, for U\*) |
+| Bootstrap | the $\alpha$ quantile of all bootstrap scores for that table × analysis model × index |
+| Bootstrap by ability | the same quantile computed within the respondent's ability quintile |
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+pooled <- readRDS("persondata_v2/pooled_results.rds")
+manifest <- readRDS("persondata_v2/manifest.rds")
+settings <- readRDS("persondata_v2/settings.rds")
+
+alpha <- settings$alpha
+index_levels <- c("lz*", "U*", "W*", "ECI_Z2*", "ECI_Z4*")
+model_levels <- c("1PL", "2PL", "3PL")
+method_levels <- c("Normal theory", "Bootstrap", "Bootstrap by ability")
+
+index_colors <- c(
+  "lz*"     = "#2a78d6",
+  "U*"      = "#eb6834",
+  "W*"      = "#1baf7a",
+  "ECI_Z2*" = "#eda100",
+  "ECI_Z4*" = "#e87ba4"
+)
+model_colors <- c("1PL" = "#2a78d6", "2PL" = "#eb6834", "3PL" = "#1baf7a")
+method_colors <- c(
+  "Normal theory"        = "#7a7975",
+  "Bootstrap"            = "#2a78d6",
+  "Bootstrap by ability" = "#eb6834"
+)
+
+theme_pf <- theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e1e0d9"),
+    axis.line = element_line(color = "#c3c2b7"),
+    text = element_text(color = "#0b0b0b"),
+    axis.text = element_text(color = "#52514e"),
+    strip.text = element_text(face = "bold"),
+    plot.title.position = "plot",
+    legend.position = "top"
+  )
+theme_set(theme_pf)
+
+as_index <- function(x) factor(x, levels = index_levels)
+as_model <- function(x) factor(x, levels = model_levels)
+as_method <- function(x) factor(x, levels = method_levels)
+
+ok <- manifest |> filter(status == "ok")
+working_model <- setNames(ok$working_model, ok$dataset)
+
+# table-level design facets joined onto every analysis table
+design <- ok |>
+  select(dataset, n_persons, n_items, working_model, working_acceptable_fit)
+
+pct <- function(x, digits = 1) paste0(formatC(100 * x, format = "f", digits = digits), "%")
+```
+
+## 1. What was run
+
+```{r}
+#| label: manifest
+
+manifest |>
+  select(dataset, status, n_persons, n_items, density_raw,
+         n_dropped_persons, n_dropped_items, working_model,
+         working_RMSEA, working_SRMSR, working_acceptable_fit, elapsed_secs) |>
+  arrange(n_items, n_persons) |>
+  kable(
+    digits = c(0, 0, 0, 0, 2, 0, 0, 0, 3, 3, 0, 0),
+    caption = "Tables in the pilot, ordered by test length. density_raw is the proportion of observed responses before complete-case deletion (the engine requires complete data)."
+  )
+```
+
+```{r}
+#| label: failures
+#| results: asis
+
+failed <- manifest |> filter(status != "ok")
+if (nrow(failed) > 0) {
+  cat("Tables that did not complete:\n\n")
+  cat(paste0("- `", failed$dataset, "`: ", failed$reason, collapse = "\n"), "\n")
+} else {
+  cat("All tables completed.\n")
+}
+```
+
+`r nrow(ok)` of `r nrow(manifest)` tables completed, spanning `r min(ok$n_items)`–`r max(ok$n_items)` items and `r format(min(ok$n_persons), big.mark = ",")`–`r format(max(ok$n_persons), big.mark = ",")` persons, at $\alpha =$ `r alpha`, `r settings$bootstrap_reps` bootstrap replicates, and `r settings$n_ability_bins` ability bins. Total runtime was **`r round(sum(manifest$elapsed_secs, na.rm = TRUE) / 60, 1)` minutes** on `r settings$bootstrap_cores` cores.
+
+## 2. Model selection: relative and absolute fit
+
+The working model is chosen by `r settings$model_selection`. AIC and BIC only rank the three models; they say nothing about whether the winner fits. Each calibrated model is therefore also evaluated with the limited-information M2 statistic and its RMSEA and SRMSR, computed in `mirt` with item parameters fixed at exactly the estimates used for person-fit scoring. Fit is called *acceptable* when RMSEA ≤ `r settings$rmsea_cutoff` and SRMSR ≤ `r settings$srmsr_cutoff` (Maydeu-Olivares & Joe, 2014).
+
+```{r}
+#| label: model-selection-summary
+
+pooled$model_comparison |>
+  summarise(
+    `AIC choice` = paste(Model[Preferred_by_AIC], collapse = ", "),
+    `BIC choice (working)` = Model[Working_model],
+    `Working RMSEA` = RMSEA[Working_model],
+    `Working SRMSR` = SRMSR[Working_model],
+    `Working acceptable` = Acceptable_fit[Working_model],
+    `Models with acceptable fit` = paste(Model[Acceptable_fit %in% TRUE], collapse = ", "),
+    .by = dataset
+  ) |>
+  left_join(design |> select(dataset, n_items, n_persons), by = "dataset") |>
+  relocate(n_items, n_persons, .after = dataset) |>
+  arrange(n_items, n_persons) |>
+  kable(digits = 3, caption = "Relative choice vs. absolute fit, per table.")
+```
+
+```{r}
+#| label: absolute-fit-plot
+#| fig-width: 9
+#| fig-height: 6
+
+pooled$model_comparison |>
+  filter(is.finite(RMSEA)) |>
+  select(dataset, Model, Working_model, RMSEA, SRMSR) |>
+  pivot_longer(c(RMSEA, SRMSR), names_to = "Statistic", values_to = "Value") |>
+  mutate(
+    Model = as_model(Model),
+    dataset = factor(dataset, levels = rev(design$dataset[order(design$n_items, design$n_persons)])),
+    cutoff = ifelse(Statistic == "RMSEA", settings$rmsea_cutoff, settings$srmsr_cutoff)
+  ) |>
+  ggplot(aes(x = Value, y = dataset, color = Model)) +
+  geom_vline(aes(xintercept = cutoff), linetype = "dashed", color = "#52514e") +
+  geom_point(aes(shape = Working_model), size = 2.6) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1), labels = c(`TRUE` = "working model", `FALSE` = "other"), name = NULL) +
+  scale_color_manual(values = model_colors) +
+  facet_wrap(~ Statistic, scales = "free_x") +
+  labs(
+    title = "Absolute fit of each model, per table",
+    subtitle = "Filled point = BIC-selected working model. Dashed line = acceptability cutoff. Tables ordered by test length (shortest at top).",
+    x = NULL, y = NULL
+  )
+```
+
+```{r}
+#| label: fit-counts
+
+fit_counts <- pooled$model_comparison |>
+  filter(Working_model) |>
+  summarise(
+    n = n(),
+    acceptable = sum(Acceptable_fit %in% TRUE),
+    rmsea_ok = sum(RMSEA <= settings$rmsea_cutoff, na.rm = TRUE),
+    srmsr_ok = sum(SRMSR <= settings$srmsr_cutoff, na.rm = TRUE)
+  )
+bic_counts <- table(factor(ok$working_model, levels = model_levels))
+aic_3pl <- pooled$model_comparison |> filter(Preferred_by_AIC, Model == "3PL") |> nrow()
+```
+
+BIC selects the 1PL for `r bic_counts[["1PL"]]` tables, the 2PL for `r bic_counts[["2PL"]]` and the 3PL for `r bic_counts[["3PL"]]`; AIC picks the 3PL for `r aic_3pl`. In absolute terms, the working model meets the RMSEA criterion in `r fit_counts$rmsea_ok` of `r fit_counts$n` tables, the SRMSR criterion in `r fit_counts$srmsr_ok`, and both in **`r fit_counts$acceptable`**.
+
+```{r}
+#| label: fit-extra
+
+no_fit <- pooled$model_comparison |>
+  summarise(any_ok = any(Acceptable_fit %in% TRUE), .by = dataset) |>
+  filter(!any_ok) |>
+  pull(dataset)
+m2_sig <- sum(pooled$model_comparison$M2_p < 0.05, na.rm = TRUE)
+m2_n <- sum(is.finite(pooled$model_comparison$M2_p))
+```
+
+Relative and absolute fit tell different stories. In `r length(no_fit)` tables (`r paste0("\x60", no_fit, "\x60", collapse = ", ")`) **none** of the three models reaches acceptable fit, so BIC is picking the least bad of three misfitting models. The M2 test itself rejects in `r m2_sig` of `r m2_n` model fits, as expected at these sample sizes, so RMSEA and SRMSR are the more useful summaries.
+
+This matters beyond model selection. The bootstrap in Sections 4–5 simulates from the working model. Where that model does not fit, the reference distribution describes data cleaner than the real data, and some of any "excess" flagging there is misfit of the model rather than of the persons. Section 5 shows this is where most of the ability-dependence comes from.
+
+## 3. Flagging rates under normal-theory cutoffs
+
+This section describes the observed flagging rates with the conventional cutoffs, broken down along every design dimension we have: test length, sample size, working model, analysis model and index.
+
+```{r}
+#| label: flag-long
+
+flags <- pooled$calibrated_flagging |>
+  left_join(design, by = "dataset") |>
+  mutate(
+    Index = as_index(Index),
+    Analysis_model = as_model(Analysis_model),
+    Method = as_method(Method),
+    Rate = Percent_flagged / 100,
+    Working = paste("Working:", working_model)
+  )
+```
+
+```{r}
+#| label: flag-by-length
+#| fig-width: 9.5
+#| fig-height: 9
+
+flags |>
+  filter(Method == "Normal theory") |>
+  ggplot(aes(x = n_items, y = Rate, color = working_model)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_point(size = 1.9, alpha = 0.85) +
+  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x, se = FALSE,
+              color = "#0b0b0b", linewidth = 0.5) +
+  scale_color_manual(values = model_colors, name = "Working model") +
+  scale_x_log10() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
+  labs(
+    title = "Normal-theory flagging rate by test length",
+    subtitle = "Rows = index, columns = analysis model, color = table's working model. Dashed line = nominal alpha.",
+    x = "Number of items (log scale)", y = "Flagged"
+  )
+```
+
+```{r}
+#| label: flag-by-n
+#| fig-width: 9.5
+#| fig-height: 9
+
+flags |>
+  filter(Method == "Normal theory") |>
+  ggplot(aes(x = n_persons, y = Rate, color = working_model)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_point(size = 1.9, alpha = 0.85) +
+  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x, se = FALSE,
+              color = "#0b0b0b", linewidth = 0.5) +
+  scale_color_manual(values = model_colors, name = "Working model") +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
+  labs(
+    title = "Normal-theory flagging rate by sample size",
+    subtitle = "Rows = index, columns = analysis model, color = table's working model. Dashed line = nominal alpha.",
+    x = "Number of persons (log scale)", y = "Flagged"
+  )
+```
+
+```{r}
+#| label: flag-model-index
+#| fig-width: 9
+#| fig-height: 4.5
+
+flags |>
+  filter(Method == "Normal theory") |>
+  ggplot(aes(x = Analysis_model, y = Rate, color = Index)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8), width = 0.7) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.8), size = 0.9, alpha = 0.5) +
+  scale_color_manual(values = index_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ Working, nrow = 1) +
+  labs(
+    title = "Normal-theory flagging rate by working model, analysis model and index",
+    subtitle = "One point per table. Dashed line = nominal alpha.",
+    x = "Analysis model", y = "Flagged"
+  )
+```
+
+```{r}
+#| label: flag-trend-table
+
+flags |>
+  filter(Method == "Normal theory") |>
+  summarise(
+    `Median rate` = median(Rate),
+    `Min` = min(Rate),
+    `Max` = max(Rate),
+    `r with log(items)` = cor(Rate, log(n_items)),
+    `r with log(persons)` = cor(Rate, log(n_persons)),
+    .by = c(Index, Analysis_model)
+  ) |>
+  arrange(Index, Analysis_model) |>
+  kable(digits = 3, caption = "Normal-theory flagging rate across tables, with its correlation with test length and sample size. Correlations are across tables and descriptive only.")
+```
+
+```{r}
+#| label: s3-numbers
+
+nt <- flags |> filter(Method == "Normal theory")
+nt_by_model <- nt |> summarise(med = median(Rate), .by = Analysis_model)
+nt_by_index <- nt |> summarise(med = median(Rate), min = min(Rate), .by = Index)
+cells <- nt |>
+  summarise(
+    r_n = cor(Rate, log(n_persons)),
+    r_items = cor(Rate, log(n_items)),
+    r_items_short = cor(Rate[n_items < 40], log(n_items[n_items < 40])),
+    .by = c(Index, Analysis_model)
+  )
+long_tables <- ok |> filter(n_items >= 40)
+nt_fit <- nt |> summarise(med = median(Rate), .by = working_acceptable_fit)
+```
+
+Pooled over tables, analysis models and indices, the median normal-theory flagging rate is **`r pct(median(nt$Rate))`**, and `r pct(mean(nt$Rate > alpha), 0)` of combinations are above the nominal `r pct(alpha, 0)`.
+
+- **Index.** lz\* is above $\alpha$ for every table and model (minimum `r pct(nt_by_index$min[nt_by_index$Index == "lz*"])`). ECI_Z2\* is the only index usually *below* it (median `r pct(nt_by_index$med[nt_by_index$Index == "ECI_Z2*"])`).
+- **Analysis model.** Scoring under the 1PL flags the most (median `r pct(nt_by_model$med[nt_by_model$Analysis_model == "1PL"])`, against `r pct(nt_by_model$med[nt_by_model$Analysis_model == "2PL"])` for the 2PL and `r pct(nt_by_model$med[nt_by_model$Analysis_model == "3PL"])` for the 3PL).
+- **Sample size.** No consistent relationship. Across-table correlations with log N range from `r sprintf('%.2f', min(cells$r_n))` to `r sprintf('%.2f', max(cells$r_n))` over the 15 index × analysis-model cells, mostly weakly negative.
+- **Test length.** Longer tests appear to flag more: the correlation with log(items) is positive in `r sum(cells$r_items > 0)` of 15 cells. But this rests on the `r nrow(long_tables)` tables with 40+ items (`r paste0("\x60", long_tables$dataset, "\x60", collapse = ", ")`). Without them, the correlations shrink to between `r sprintf('%.2f', min(cells$r_items_short))` and `r sprintf('%.2f', max(cells$r_items_short))`. Neither long table's working model fits acceptably, so test length and model misfit cannot be separated here.
+- **Absolute fit.** Tables whose working model fails the RMSEA/SRMSR criteria flag more (median `r pct(nt_fit$med[!nt_fit$working_acceptable_fit])` against `r pct(nt_fit$med[nt_fit$working_acceptable_fit])`). This is the first sign of a theme that recurs in Section 5.
+
+## 4. Bootstrap critical values and reflagging
+
+For each table, `r settings$bootstrap_reps` datasets were simulated from the working model's item parameters and WL ability estimates, recalibrated under each analysis model, and rescored. Pooling the scores across replicates gives each index's null distribution on data of exactly that table's shape. Its $\alpha$ quantile (the $1-\alpha$ quantile for U\*) is the **empirical critical value**.
+
+### 4a. How far the empirical critical values are from the normal cutoff
+
+```{r}
+#| label: cv-plot
+#| fig-width: 9.5
+#| fig-height: 8
+
+cv <- pooled$critical_values |>
+  left_join(design, by = "dataset") |>
+  mutate(Index = as_index(Index), Analysis_model = as_model(Analysis_model))
+
+cv |>
+  filter(Type == "Unconditional") |>
+  ggplot(aes(x = n_items, y = Critical_value, color = Analysis_model)) +
+  geom_hline(aes(yintercept = Normal_cutoff), linetype = "dashed", color = "#52514e") +
+  geom_point(size = 1.9, alpha = 0.85, position = position_dodge(width = 0.04)) +
+  scale_color_manual(values = model_colors, name = "Analysis model") +
+  scale_x_log10() +
+  facet_wrap(~ Index, nrow = 2, scales = "free_y") +
+  labs(
+    title = "Empirical (bootstrap) critical values vs. the normal-theory cutoff",
+    subtitle = paste0("Dashed line = normal cutoff (", round(qnorm(alpha), 3), "; +", round(qnorm(1 - alpha), 3),
+                      " for U*). Lower-tail indices: a value below the line means the normal cutoff over-flags."),
+    x = "Number of items (log scale)", y = "Critical value"
+  )
+```
+
+```{r}
+#| label: cv-summary
+
+cv |>
+  filter(Type == "Unconditional") |>
+  mutate(Shift = Critical_value - Normal_cutoff) |>
+  summarise(
+    `Normal cutoff` = first(Normal_cutoff),
+    `Median empirical` = median(Critical_value),
+    `Min empirical` = min(Critical_value),
+    `Max empirical` = max(Critical_value),
+    `Median |shift|` = median(abs(Shift)),
+    `Max MC SE` = max(Monte_Carlo_SE, na.rm = TRUE),
+    .by = c(Index, Analysis_model)
+  ) |>
+  arrange(Index, Analysis_model) |>
+  kable(digits = 3, caption = "Unconditional empirical critical values across tables. Monte Carlo SE is the SD of per-replicate quantiles over sqrt(replicates).")
+```
+
+### 4b. Do the calibrated cutoffs actually hold the Type I error at alpha?
+
+Evaluating a quantile on the scores it came from returns $\alpha$ by construction, so the null rates below are out of sample: cutoffs from odd-numbered replicates are applied to even-numbered replicates and vice versa. For normal theory, the null rate is simply the bootstrap flagging rate.
+
+```{r}
+#| label: null-rates
+#| fig-width: 9
+#| fig-height: 5
+
+flags |>
+  ggplot(aes(x = Index, y = Null_rate, color = Method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.75), size = 1, alpha = 0.6) +
+  scale_color_manual(values = method_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ Analysis_model, nrow = 1, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
+  labs(
+    title = "Type I error on clean, model-generated data, by flagging method",
+    subtitle = "One point per table. Dashed line = nominal alpha.",
+    x = NULL, y = "Null flagging rate"
+  )
+```
+
+```{r}
+#| label: null-summary
+
+null_summary <- flags |>
+  summarise(
+    `Median null` = median(Null_rate),
+    `Min null` = min(Null_rate),
+    `Max null` = max(Null_rate),
+    `Share within ±0.01 of alpha` = mean(abs(Null_rate - alpha) <= 0.01),
+    .by = Method
+  ) |>
+  arrange(Method)
+kable(null_summary, digits = 3, caption = "Null flagging rate across all table × analysis model × index combinations.")
+```
+
+### 4c. Observed flagging after reflagging
+
+```{r}
+#| label: reflag-plot
+#| fig-width: 9.5
+#| fig-height: 9
+
+flags |>
+  ggplot(aes(x = n_items, y = Rate, color = Method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_point(size = 1.5, alpha = 0.75) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.6) +
+  scale_color_manual(values = method_colors) +
+  scale_x_log10() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
+  labs(
+    title = "Observed flagging rate by method, as a function of test length",
+    subtitle = "Rows = index, columns = analysis model. Dashed line = nominal alpha.",
+    x = "Number of items (log scale)", y = "Flagged"
+  )
+```
+
+```{r}
+#| label: reflag-summary
+
+reflag_summary <- flags |>
+  summarise(
+    `Median observed` = median(Rate),
+    `IQR observed` = IQR(Rate),
+    `Median null` = median(Null_rate),
+    `Median excess` = median(Rate - Null_rate),
+    `Share of combos above alpha` = mean(Rate > alpha),
+    .by = c(Index, Method)
+  ) |>
+  arrange(Index, Method)
+kable(reflag_summary, digits = 3, caption = "Observed flagging by index and method, pooled over tables and analysis models. Excess = observed minus that method's null rate.")
+```
+
+```{r}
+#| label: reflag-model-spread
+
+model_spread <- flags |>
+  summarise(Spread = max(Rate) - min(Rate), .by = c(dataset, Index, Method)) |>
+  summarise(`Median spread across analysis models` = median(Spread),
+            `Max spread` = max(Spread), .by = Method) |>
+  arrange(Method)
+kable(model_spread, digits = 3, caption = "How much the choice of analysis model moves the flagging rate for a given table and index (max minus min over the three analysis models).")
+```
+
+```{r}
+#| label: s4-numbers
+
+cv_u <- cv |> filter(Type == "Unconditional")
+null_m <- flags |> summarise(med = median(Null_rate), min = min(Null_rate), max = max(Null_rate), .by = Method)
+obs_m <- flags |> summarise(med = median(Rate), above = mean(Rate > alpha), excess = median(Rate - Null_rate), .by = Method)
+g <- function(tab, method, col) tab[[col]][tab$Method == method]
+eci2_shift <- cv_u |> filter(Index == "ECI_Z2*") |> summarise(m = median(Critical_value - Normal_cutoff))
+u_range <- cv_u |> filter(Index == "U*") |> summarise(lo = min(Critical_value), hi = max(Critical_value))
+spread_m <- model_spread
+```
+
+**Critical values.** The empirical cutoffs depart from ±1.645 in ways that depend on the index. ECI_Z2\*'s sits closer to zero (median shift +`r round(eci2_shift$m, 2)`), so the normal cutoff is too strict for it. lz\*'s sits a little further out. U\*'s varies the most, from `r sprintf('%.2f', u_range$lo)` to `r sprintf('%.2f', u_range$hi)` depending on table and analysis model. Monte Carlo SEs are at most `r round(max(cv_u$Monte_Carlo_SE, na.rm = TRUE), 3)`, so these shifts are not replicate noise.
+
+**Calibration holds out of sample.** Under normal theory, the null flagging rate ranges from `r pct(g(null_m, "Normal theory", "min"))` to `r pct(g(null_m, "Normal theory", "max"))` across combinations. With bootstrap cutoffs it is between `r pct(g(null_m, "Bootstrap", "min"), 2)` and `r pct(g(null_m, "Bootstrap", "max"), 2)` in every case, and with ability-conditional cutoffs `r pct(g(null_m, "Bootstrap by ability", "min"))`–`r pct(g(null_m, "Bootstrap by ability", "max"))` (median `r pct(g(null_m, "Bootstrap by ability", "med"))`). The low end of the ability-conditional range comes from `pks_probability`, whose top quintile under the 1PL and 2PL is a single response pattern; there the method falls back to the unconditional cutoff (Section 5), and that bin's null rate is near zero.
+
+**Reflagging.** The median observed rate changes little: `r pct(g(obs_m, "Normal theory", "med"))` → `r pct(g(obs_m, "Bootstrap", "med"))` → `r pct(g(obs_m, "Bootstrap by ability", "med"))`. What changes is the reference point. Once each index is judged against its own calibrated null, `r pct(g(obs_m, "Bootstrap", "above"), 0)` (bootstrap) and `r pct(g(obs_m, "Bootstrap by ability", "above"), 0)` (by ability) of combinations flag more than $\alpha$, up from `r pct(g(obs_m, "Normal theory", "above"), 0)`. The excess is small: a median of `r round(100 * g(obs_m, "Bootstrap", "excess"), 1)` percentage points over the null. Real data show slightly more misfit than clean data of the same shape almost everywhere, but not by much.
+
+Calibration also shrinks the effect of the analysis model. The median gap between the highest and lowest of the three analysis models, for a given table and index, falls from `r round(100 * g(spread_m, "Normal theory", "Median spread across analysis models"), 1)` to `r round(100 * g(spread_m, "Bootstrap", "Median spread across analysis models"), 1)` points. Part of what looked like model dependence was each model's own miscalibration. The worst cases go the other way: the largest gap grows from `r round(100 * g(spread_m, "Normal theory", "Max spread"), 1)` to `r round(100 * g(spread_m, "Bootstrap", "Max spread"), 1)` points, so calibration does not rescue a table where the three models disagree badly.
+
+## 5. Ability-conditional calibration
+
+The Sept 10 results showed that normal-theory flagging depends on where a respondent sits on θ. If that pattern is a property of the index's null distribution, calibrating within ability quintiles should remove it. If it reflects genuine differences in misfit across ability, it should survive.
+
+Bins are defined by quintile cut points of the observed θ under each analysis model; bootstrap respondents are assigned by their re-estimated θ, and each bin gets its own critical value. Because cut points (not ranks) are used, tied θ values always fall in the same bin, so bins can be unequal when θ is coarse (notably under the 1PL on short tests). A bin falls back to the unconditional bootstrap cutoff when it is **degenerate**, meaning more than half of its bootstrap scores within a replicate share a single value. A quantile of a point mass would flag everyone in the bin or no one. This happens only in `pks_probability` (12 items), where all 112 respondents in the top quintile under the 1PL and 2PL have the same response pattern; before the guard was added, ability-conditional ECI_Z2\* flagged all of them.
+
+```{r}
+#| label: ability-long
+
+ability <- pooled$calibrated_ability_conditional |>
+  left_join(design, by = "dataset") |>
+  mutate(
+    Index = as_index(Index),
+    Analysis_model = as_model(Analysis_model),
+    Method = as_method(Method),
+    Rate = Percent_flagged / 100
+  )
+
+# working model as analysis model is the main view
+ability_w <- ability |> filter(Analysis_model == working_model)
+```
+
+### 5a. Null rates across ability
+
+```{r}
+#| label: ability-null-plot
+#| fig-width: 9.5
+#| fig-height: 8
+
+ability_w |>
+  summarise(Null_rate = mean(Null_rate, na.rm = TRUE), .by = c(Method, Index, Ability_bin)) |>
+  ggplot(aes(x = Ability_bin, y = Null_rate, color = Method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = method_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ Index, nrow = 2) +
+  labs(
+    title = "Null flagging rate by ability quintile, averaged over tables",
+    subtitle = "Scores under each table's working model. Dashed line = nominal alpha.",
+    x = "Ability quintile (1 = lowest)", y = "Null flagging rate"
+  )
+```
+
+### 5b. Observed rates across ability
+
+```{r}
+#| label: ability-observed-plot
+#| fig-width: 9.5
+#| fig-height: 8
+
+ability_w |>
+  ggplot(aes(x = Ability_bin, y = Rate, color = Method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_line(aes(group = interaction(dataset, Method)), alpha = 0.15, linewidth = 0.4) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.1) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  scale_color_manual(values = method_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  coord_cartesian(ylim = c(0, NA)) +
+  facet_wrap(~ Index, nrow = 2) +
+  labs(
+    title = "Observed flagging rate by ability quintile",
+    subtitle = "Thin lines = individual tables; thick lines = mean over tables. Working model as analysis model.",
+    x = "Ability quintile (1 = lowest)", y = "Flagged"
+  )
+```
+
+### 5c. Does flagging become more stable across θ?
+
+Stability is summarised per table × analysis model × index × method as the **range** (max minus min) and **SD** of the five quintile flagging rates. Lower is flatter.
+
+```{r}
+#| label: stability-theta
+
+theta_stability <- ability |>
+  summarise(
+    Range = max(Rate, na.rm = TRUE) - min(Rate, na.rm = TRUE),
+    SD = sd(Rate, na.rm = TRUE),
+    Null_range = max(Null_rate, na.rm = TRUE) - min(Null_rate, na.rm = TRUE),
+    .by = c(dataset, n_items, n_persons, working_model, Analysis_model, Index, Method)
+  )
+
+theta_stability |>
+  summarise(
+    `Median null range` = median(Null_range),
+    `Median observed range` = median(Range),
+    `Median observed SD` = median(SD),
+    .by = c(Index, Method)
+  ) |>
+  arrange(Index, Method) |>
+  kable(digits = 3, caption = "Flatness of flagging across ability quintiles, pooled over tables and analysis models.")
+```
+
+```{r}
+#| label: stability-theta-plot
+#| fig-width: 9.5
+#| fig-height: 8
+
+theta_stability |>
+  ggplot(aes(x = n_items, y = Range, color = Method)) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.6) +
+  scale_color_manual(values = method_colors) +
+  scale_x_log10() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
+  labs(
+    title = "Range of quintile flagging rates, by test length and method",
+    subtitle = "Rows = index, columns = analysis model. Lower = flagging more uniform across theta.",
+    x = "Number of items (log scale)", y = "Max − min over quintiles"
+  )
+```
+
+```{r}
+#| label: stability-paired
+
+paired <- theta_stability |>
+  select(dataset, Analysis_model, Index, Method, Range) |>
+  pivot_wider(names_from = Method, values_from = Range) |>
+  mutate(
+    `Bootstrap vs normal` = Bootstrap - `Normal theory`,
+    `By ability vs normal` = `Bootstrap by ability` - `Normal theory`,
+    `By ability vs bootstrap` = `Bootstrap by ability` - Bootstrap
+  )
+
+paired |>
+  summarise(
+    `Median change: bootstrap - normal` = median(`Bootstrap vs normal`),
+    `Median change: by ability - normal` = median(`By ability vs normal`),
+    `Share flatter by ability than normal` = mean(`By ability vs normal` < 0),
+    `Share flatter by ability than bootstrap` = mean(`By ability vs bootstrap` < 0),
+    .by = Index
+  ) |>
+  arrange(as_index(Index)) |>
+  kable(digits = 3, caption = "Paired comparison of quintile range within each table × analysis model × index. Negative change = flatter.")
+```
+
+### 5d. Ability-dependence and absolute fit
+
+```{r}
+#| label: ability-by-fit
+#| fig-width: 9.5
+#| fig-height: 5.5
+
+ability_w |>
+  mutate(Fit = ifelse(working_acceptable_fit, "Working model fits acceptably", "Working model does not fit")) |>
+  summarise(Rate = mean(Rate, na.rm = TRUE), .by = c(Fit, Method, Index, Ability_bin)) |>
+  ggplot(aes(x = Ability_bin, y = Rate, color = Index)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  scale_color_manual(values = index_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_grid(Fit ~ Method) +
+  labs(
+    title = "Observed flagging by ability quintile, split by whether the working model fits",
+    subtitle = "Mean over tables; working model as analysis model. Dashed line = nominal alpha.",
+    x = "Ability quintile (1 = lowest)", y = "Flagged"
+  )
+```
+
+```{r}
+#| label: ability-by-fit-table
+
+by_fit <- ability_w |>
+  filter(Method == "Bootstrap by ability") |>
+  summarise(Rate = mean(Rate, na.rm = TRUE), .by = c(working_acceptable_fit, Index, Ability_bin)) |>
+  mutate(Ability_bin = paste0("Q", Ability_bin)) |>
+  pivot_wider(names_from = Ability_bin, values_from = Rate) |>
+  arrange(as_index(Index), desc(working_acceptable_fit))
+
+by_fit |>
+  rename(`Working model acceptable` = working_acceptable_fit) |>
+  kable(digits = 3, caption = "Ability-conditionally calibrated flagging rate by quintile, averaged over tables, split by absolute fit of the working model.")
+```
+
+```{r}
+#| label: s5-numbers
+
+null_q <- ability_w |>
+  summarise(null = mean(Null_rate, na.rm = TRUE), obs = mean(Rate, na.rm = TRUE), .by = c(Method, Index, Ability_bin))
+q <- function(method, index, bin, col) null_q[[col]][null_q$Method == method & null_q$Index == index & null_q$Ability_bin == bin]
+rng <- theta_stability |> summarise(null = median(Null_range), obs = median(Range), .by = Method)
+r <- function(method, col) rng[[col]][rng$Method == method]
+flat_share <- mean(paired$`By ability vs normal` < 0)
+eci2_flat_boot <- mean(paired$`By ability vs bootstrap`[paired$Index == "ECI_Z2*"] < 0)
+fit_rng <- by_fit |>
+  mutate(lo = pmin(Q1, Q2, Q3, Q4, Q5), hi = pmax(Q1, Q2, Q3, Q4, Q5)) |>
+  summarise(lo = min(lo), hi = max(hi), .by = working_acceptable_fit)
+n_fit <- sum(ok$working_acceptable_fit)
+```
+
+**The null becomes flat, as intended.** Under normal theory and the unconditional bootstrap, the null flagging rate is not flat across θ. For most indices it drops in the outer quintiles (for lz\*, only in the highest), where a person-fit index has least to work with. The effect is strongest for ECI_Z2\*, whose unconditional-bootstrap null is `r pct(q("Bootstrap", "ECI_Z2*", 1, "null"))` in the lowest quintile and `r pct(q("Bootstrap", "ECI_Z2*", 5, "null"))` in the highest, against `r pct(q("Bootstrap", "ECI_Z2*", 3, "null"))` in the middle. Calibrating within quintiles holds every quintile at essentially 5%, apart from the fallback bins in `pks_probability`: the median range of null rates across quintiles falls from `r round(100 * r("Normal theory", "null"), 1)` points under normal theory to `r round(100 * r("Bootstrap by ability", "null"), 2)`.
+
+**Observed flagging becomes only somewhat flatter.** The median range of observed quintile rates goes from `r round(100 * r("Normal theory", "obs"), 1)` points (normal theory) to `r round(100 * r("Bootstrap by ability", "obs"), 1)` (by ability). Ability-conditional calibration is flatter than normal theory in only `r pct(flat_share, 0)` of table × analysis model × index comparisons. The gain is concentrated where the null was most distorted. ECI_Z2\*'s extreme quintiles rise from `r pct(q("Normal theory", "ECI_Z2*", 1, "obs"))` and `r pct(q("Normal theory", "ECI_Z2*", 5, "obs"))` to `r pct(q("Bootstrap by ability", "ECI_Z2*", 1, "obs"))` and `r pct(q("Bootstrap by ability", "ECI_Z2*", 5, "obs"))`, and its profile is flatter than under the unconditional bootstrap in `r pct(eci2_flat_boot, 0)` of comparisons. For lz\* and U\*, the lowest quintile flags the most under *every* method (lz\*: `r pct(q("Bootstrap by ability", "lz*", 1, "obs"))` in quintile 1 with ability-conditional cutoffs).
+
+**Most of the remaining θ-dependence comes from tables where the model does not fit.** In the `r n_fit` tables whose working model meets the RMSEA/SRMSR criteria, ability-conditionally calibrated flagging stays between `r pct(fit_rng$lo[fit_rng$working_acceptable_fit])` and `r pct(fit_rng$hi[fit_rng$working_acceptable_fit])` in every quintile for every index: close to nominal and fairly flat. In the `r nrow(ok) - n_fit` tables where it does not fit, quintile rates run from `r pct(fit_rng$lo[!fit_rng$working_acceptable_fit])` to `r pct(fit_rng$hi[!fit_rng$working_acceptable_fit])`, and the low-ability lz\*/U\* spike comes mainly from these tables.
+
+So the answer to "does flagging become more stable across θ?" has two parts. Conditional calibration removes the part of the θ-dependence caused by the reference distribution, which matters most for the ECI indices. What remains is concentrated where the IRT model is inadequate, and it is better read as model misfit showing up in the person-fit statistics than as respondents at some ability levels being more aberrant. With `r nrow(ok)` tables this is a pattern, not a test.
+
+## 6. Summary
+
+```{r}
+#| label: summary-numbers
+
+kappa_med <- pooled$model_stability |> summarise(k = median(Cohen_kappa, na.rm = TRUE), .by = c(Model_1, Model_2))
+boot_fail <- pooled$bootstrap_details |> filter(Error != "") |> distinct(dataset, Replicate, Analysis_model) |> count(dataset, Analysis_model)
+```
+
+1. **Absolute fit.** The BIC-selected working model fits acceptably in `r fit_counts$acceptable` of `r fit_counts$n` tables; in `r length(no_fit)`, no model does. Model selection should report both, and tables without an adequate model need to be handled differently. At minimum they should be flagged, since their bootstrap reference is too optimistic.
+2. **Normal-theory flagging** is somewhat above nominal overall (median `r pct(median(nt$Rate))`), and it varies by index and analysis model. It is higher where the working model fits poorly. The apparent test-length effect depends on two long, poorly fitting tables.
+3. **Bootstrap critical values** hold Type I error at `r pct(alpha, 0)` out of sample for every table, model and index. After reflagging, nearly every combination flags a little more than the null (median excess `r round(100 * g(obs_m, "Bootstrap", "excess"), 1)` points), and the choice of analysis model matters less.
+4. **Ability-conditional calibration** makes the null flat across θ (except in degenerate bins, which fall back to the unconditional cutoff) and makes observed flagging somewhat flatter, most clearly for ECI_Z2\*. The remaining θ-dependence sits mainly in tables where the working model does not fit.
+5. **Unchanged from 10 September:** no respondent in any table is flagged by all five indices, under any of the three methods (Supplement S6). Calibration fixes the level of flagging, not the disagreement about *who* misfits.
+
+**Before scaling up:**
+
+- Tables where BIC picks the 3PL but the 3PL person-fit calibration is singular currently fail outright (see Section 1). The engine should fall back to the next-best model, or use mirt, rather than drop the table.
+- 3PL bootstrap replicates fail to recalibrate fairly often (up to `r max(boot_fail$n[boot_fail$Analysis_model == "3PL"], 0)` of `r settings$bootstrap_reps` in one table; Supplement S7). Those 3PL critical values rest on fewer replicates, and failures may not be random.
+- Complete-case deletion is not neutral: `experimental_iq` loses `r ok$n_dropped_persons[ok$dataset == "experimental_iq"]` of `r ok$n_persons_raw[ok$dataset == "experimental_iq"]` respondents.
+- Test length needs to be varied deliberately, among tables with adequate model fit, if it is to be a design facet.
+- Very short tests can produce ability bins made of a single response pattern. The engine now detects these and falls back to the unconditional cutoff, but they signal that conditional calibration needs enough items to spread θ.
+- Cost: rescoring every replicate under three models is the dominant expense (`r round(max(manifest$elapsed_secs, na.rm = TRUE) / 60)` minutes for the largest table on `r settings$bootstrap_cores` cores).
+
+## Supplement
+
+### S1. Full model comparison
+
+```{r}
+#| label: s-model-comparison
+
+pooled$model_comparison |>
+  mutate(Model = as_model(Model)) |>
+  select(dataset, Model, N_parameters, Log_likelihood, AIC, BIC, Delta_AIC, Delta_BIC,
+         M2, M2_df, M2_p, RMSEA, RMSEA_5, RMSEA_95, SRMSR, CFI, TLI,
+         Acceptable_fit, Working_model, PFS_OK) |>
+  arrange(dataset, Model) |>
+  kable(digits = 3, caption = "Relative and absolute fit for every table and model.")
+```
+
+### S2. Full flagging table
+
+```{r}
+#| label: s-flagging
+
+flags |>
+  select(dataset, n_items, n_persons, working_model, Analysis_model, Index, Method,
+         N_valid, N_flagged, Rate, Null_rate, Excess) |>
+  arrange(dataset, Analysis_model, Index, Method) |>
+  kable(digits = 4, caption = "Every table × analysis model × index × method.")
+```
+
+### S3. Critical values, including by ability quintile
+
+```{r}
+#| label: s-critical-values
+
+cv |>
+  select(dataset, Analysis_model, Index, Tail, Type, Ability_bin, Theta_lower, Theta_upper,
+         N_boot_scores, Normal_cutoff, Critical_value, Monte_Carlo_SE, Fallback_to_unconditional) |>
+  arrange(dataset, Analysis_model, Index, Type, Ability_bin) |>
+  kable(digits = 3, caption = "Empirical critical values. Unconditional rows have Ability_bin NA.")
+```
+
+```{r}
+#| label: s-cv-by-bin
+#| fig-width: 9.5
+#| fig-height: 8
+
+cv |>
+  filter(Type == "By ability", Analysis_model == working_model) |>
+  ggplot(aes(x = Ability_bin, y = Critical_value, group = dataset)) +
+  geom_hline(aes(yintercept = Normal_cutoff), linetype = "dashed", color = "#52514e") +
+  geom_line(color = "#2a78d6", alpha = 0.45) +
+  geom_point(color = "#2a78d6", size = 1, alpha = 0.6) +
+  facet_wrap(~ Index, nrow = 2, scales = "free_y") +
+  labs(
+    title = "Ability-conditional critical values under the working model",
+    subtitle = "One line per table. Dashed line = normal cutoff.",
+    x = "Ability quintile", y = "Critical value"
+  )
+```
+
+### S4. Cross-model stability of scores and flags
+
+Formerly Section 5. Normal-theory flags.
+
+```{r}
+#| label: s-stability
+
+pooled$model_stability |>
+  mutate(Pair = paste(Model_1, "vs", Model_2)) |>
+  summarise(
+    `Median Pearson r` = median(Pearson_r, na.rm = TRUE),
+    `Median Spearman r` = median(Spearman_r, na.rm = TRUE),
+    `Median kappa` = median(Cohen_kappa, na.rm = TRUE),
+    `Min kappa` = min(Cohen_kappa, na.rm = TRUE),
+    `Median % flags changed` = median(Percent_changed, na.rm = TRUE),
+    .by = c(Pair, Index)
+  ) |>
+  arrange(Pair, as_index(Index)) |>
+  kable(digits = 3, caption = "Pooled across tables.")
+```
+
+```{r}
+#| label: s-stability-full
+
+pooled$model_stability |>
+  mutate(Pair = paste(Model_1, "vs", Model_2)) |>
+  select(dataset, Pair, Index, N_common, Pearson_r, Spearman_r, Agreement_rate, Percent_changed, Cohen_kappa) |>
+  arrange(dataset, Pair, as_index(Index)) |>
+  kable(digits = 3, caption = "Cross-model stability, per table.")
+```
+
+### S5. Empirical distributions of the indices
+
+Formerly Section 7.
+
+```{r}
+#| label: s-distributions
+
+pooled$distributions |>
+  filter(Model == working_model[dataset]) |>
+  summarise(
+    `Median mean` = median(Mean),
+    `Median SD` = median(SD),
+    `Median skewness` = median(Skewness),
+    `Median excess kurtosis` = median(Excess_kurtosis),
+    .by = Index
+  ) |>
+  arrange(as_index(Index)) |>
+  kable(digits = 3, caption = "Under each table's working model, pooled over tables. N(0,1) would be 0, 1, 0, 0.")
+```
+
+```{r}
+#| label: s-distributions-full
+
+pooled$distributions |>
+  mutate(Model = as_model(Model)) |>
+  select(dataset, Model, Index, N_valid, Mean, SD, Skewness, Excess_kurtosis) |>
+  arrange(dataset, Model, as_index(Index)) |>
+  kable(digits = 3, caption = "Moments of each index, every table × model.")
+```
+
+### S6. Agreement between indices
+
+Formerly the Appendix C person-level summary. Counts respondents flagged by at least one and by all five indices under each table's working model, for each method.
+
+```{r}
+#| label: s-index-agreement
+
+flag_sets <- list(
+  "Normal theory"        = "_flag",
+  "Bootstrap"            = "_flag_boot",
+  "Bootstrap by ability" = "_flag_bootcond"
+)
+score_names <- c("lzstar", "U_star", "W_star", "ECI_Z2_star", "ECI_Z4_star")
+
+pf_w <- pooled$person_fit |> filter(Model == working_model[dataset])
+
+bind_rows(lapply(names(flag_sets), function(method) {
+  F <- as.matrix(pf_w[, paste0(score_names, flag_sets[[method]])])
+  F[is.na(F)] <- FALSE
+  tibble(dataset = pf_w$dataset, n_flags = rowSums(F)) |>
+    summarise(
+      N = n(),
+      `>= 1 index` = mean(n_flags >= 1),
+      `>= 3 indices` = mean(n_flags >= 3),
+      `All 5` = mean(n_flags == 5),
+      .by = dataset
+    ) |>
+    mutate(Method = method, .after = dataset)
+})) |>
+  arrange(dataset, as_method(Method)) |>
+  kable(digits = 3, caption = "Share of respondents flagged by at least one, at least three, and all five indices.")
+```
+
+### S7. Bootstrap replicate spread
+
+```{r}
+#| label: s-bootstrap-spread
+
+pooled$bootstrap_details |>
+  filter(is.finite(Flag_rate)) |>
+  summarise(
+    N_replicates = n(),
+    Q05 = quantile(Flag_rate, 0.05),
+    Median = median(Flag_rate),
+    Q95 = quantile(Flag_rate, 0.95),
+    .by = c(dataset, Analysis_model, Index)
+  ) |>
+  arrange(dataset, Analysis_model, as_index(Index)) |>
+  kable(digits = 4, caption = "Normal-theory flagging rate across bootstrap replicates.")
+```
+
+```{r}
+#| label: s-bootstrap-failures
+
+pooled$bootstrap_details |>
+  filter(Error != "") |>
+  distinct(dataset, Replicate, Analysis_model) |>
+  count(dataset, Analysis_model, name = "Failed replicates") |>
+  kable(caption = "Bootstrap replicates that failed to recalibrate (all others succeeded).")
+```
+
+### S8. Item parameters
+
+```{r}
+#| label: s-item-parameters
+
+pooled$item_parameters |>
+  mutate(Model = as_model(Model)) |>
+  summarise(
+    N_items = n(),
+    `Mean a` = mean(a), `SD a` = sd(a),
+    `Mean b` = mean(b), `SD b` = sd(b),
+    `Mean c` = mean(c), `Max c` = max(c),
+    .by = c(dataset, Model)
+  ) |>
+  arrange(dataset, Model) |>
+  kable(digits = 3, caption = "Item-parameter summaries. Full estimates are in persondata_v2/TABLE_personfit/item_parameters_all_models.csv (one folder per table).")
+```
+
+## Session information
+
+```{r}
+#| label: session
+
+sessionInfo()
+```

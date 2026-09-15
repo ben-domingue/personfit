@@ -1,0 +1,618 @@
+---
+title: "Person Fit Across 1PL, 2PL and 3PL: A Proof of Concept on IRW Tables"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: show
+    df-print: kable
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+This page is a proof of concept for a revised person-fit pipeline. The earlier pilot ([`person_fit.html`](person_fit.html)) calibrated a **3PL only** and asked how six person-fit indices behaved across 18 [Item Response Warehouse](https://itemresponsewarehouse.org/) (IRW) tables. The revised engine, `analyze_irw_personfit()` in [`IRW_personfit_Sept09092026.R`](IRW_personfit_Sept09092026.R), changes the question in four ways:
+
+1. It fits **1PL, 2PL and 3PL**, compares them by AIC/BIC, and designates a **working model**.
+2. It computes the person-fit indices under **every model that calibrates**, so we can ask how much the choice of IRT model changes *who gets flagged*.
+3. It reports index behavior **conditional on ability**, rather than pooling over the whole θ range.
+4. It runs an **IRW-informed parametric bootstrap**: data are simulated from the working model's own item and person parameters, recalibrated, and rescored, giving a per-dataset, per-index **empirical Type I error rate** to compare the observed flagging rate against.
+
+That fourth item is the substantive change. In the earlier pilot, a flagging rate of 10% at $\alpha = 0.05$ could not be interpreted — it might mean genuine aberrance, or it might mean the index simply is not calibrated on data of that shape. The bootstrap separates those.
+
+The index set drops `Ht` (six indices → five: lz\*, U\*, W\*, ECI_Z2\*, ECI_Z4\*).
+
+This run covers **four tables** as a proof of concept before expanding to the full set. All computation happens in [`person_fit_v2_compute.R`](person_fit_v2_compute.R) and is cached to `persondata_v2/`; this page only loads cached results.
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+pooled <- readRDS("persondata_v2/pooled_results.rds")
+manifest <- readRDS("persondata_v2/manifest.rds")
+settings <- readRDS("persondata_v2/settings.rds")
+
+alpha <- settings$alpha
+index_levels <- c("lz*", "U*", "W*", "ECI_Z2*", "ECI_Z4*")
+model_levels <- c("1PL", "2PL", "3PL")
+
+# categorical palette, carried over from the earlier pilot for continuity
+# (fixed slot order, never cycled; validated for CVD separation)
+index_colors <- c(
+  "lz*"     = "#2a78d6",
+  "U*"      = "#eb6834",
+  "W*"      = "#1baf7a",
+  "ECI_Z2*" = "#eda100",
+  "ECI_Z4*" = "#e87ba4"
+)
+model_colors <- c("1PL" = "#2a78d6", "2PL" = "#eb6834", "3PL" = "#1baf7a")
+
+theme_pf <- theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e1e0d9"),
+    axis.line = element_line(color = "#c3c2b7"),
+    text = element_text(color = "#0b0b0b"),
+    axis.text = element_text(color = "#52514e"),
+    strip.text = element_text(face = "bold"),
+    plot.title.position = "plot",
+    legend.position = "top"
+  )
+theme_set(theme_pf)
+
+as_index <- function(x) factor(x, levels = index_levels)
+as_model <- function(x) factor(x, levels = model_levels)
+
+# the working model for each table, used repeatedly below
+working_model <- setNames(manifest$working_model, manifest$dataset)
+```
+
+## 1. What was run
+
+```{r}
+#| label: manifest
+
+manifest |>
+  select(dataset, n_persons, n_items, density_raw,
+         n_dropped_persons, n_dropped_items,
+         working_model, elapsed_secs) |>
+  kable(
+    digits = 2,
+    caption = "Tables in the proof of concept. All four are complete (density 1.00), so no persons or items had to be dropped to satisfy the engine's complete-data requirement."
+  )
+```
+
+Four small-to-medium tables were chosen from the 18 that calibrated successfully in the earlier 3PL-only pilot, spanning `r min(manifest$n_persons)`–`r max(manifest$n_persons)` persons. All four completed, at $\alpha =$ `r alpha`, `r settings$bootstrap_reps` bootstrap replicates, and `r settings$n_ability_bins` ability bins, in **`r round(sum(manifest$elapsed_secs)/60, 1)` minutes total**. Roughly 85% of that time is the bootstrap.
+
+## 2. Which model wins?
+
+The engine fits all three models and selects a working model by `r settings$model_selection`. This matters here in a way it did not before: the earlier pilot assumed the 3PL throughout and only checked 2PL-vs-3PL as a side diagnostic.
+
+```{r}
+#| label: model-comparison
+
+pooled$model_comparison |>
+  mutate(Model = as_model(Model)) |>
+  select(dataset, Model, N_parameters, Log_likelihood, AIC, BIC,
+         Delta_AIC, Delta_BIC, Working_model, PFS_OK) |>
+  arrange(dataset, Model) |>
+  kable(
+    digits = 1,
+    caption = "Relative fit of the 1PL, 2PL and 3PL for each table. Delta values are differences from the best model on that criterion within that table."
+  )
+```
+
+```{r}
+#| label: model-preference-summary
+
+pooled$model_comparison |>
+  summarise(
+    `Preferred by AIC` = paste(Model[Preferred_by_AIC], collapse = ", "),
+    `Preferred by BIC` = paste(Model[Preferred_by_BIC], collapse = ", "),
+    .by = dataset
+  ) |>
+  kable(caption = "AIC and BIC do not agree: AIC's extra-parameter penalty is light enough to favour the 3PL where BIC does not.")
+```
+
+**The 3PL is never the BIC-preferred model in these four tables.** BIC picks the 2PL three times and the 1PL once (`verbagg`). AIC, with its lighter penalty, picks the 3PL twice. All three models calibrated and produced person-fit scores for every table (`PFS_OK` is `TRUE` throughout), so the comparison is not confounded by estimation failure.
+
+This is a direct challenge to the earlier pilot's framing. Committing to the 3PL was not obviously the right default, and the choice is consequential — Section 5 shows how much the flagged set moves when the model changes.
+
+## 3. Flagging rates in the observed data
+
+```{r}
+#| label: flagging-table
+
+pooled$flagging |>
+  mutate(Model = as_model(Model), Index = as_index(Index)) |>
+  select(dataset, Model, Index, N_valid, N_flagged, Percent_flagged) |>
+  arrange(dataset, Model, Index) |>
+  kable(digits = 2, caption = "Observed flagging rates, every table x model x index.")
+```
+
+```{r}
+#| label: flagging-plot
+#| fig-width: 9
+#| fig-height: 5.5
+
+pooled$flagging |>
+  mutate(Model = as_model(Model), Index = as_index(Index)) |>
+  ggplot(aes(x = Index, y = Percent_flagged / 100, color = Index)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_point(aes(shape = Model), size = 2.6, position = position_dodge(width = 0.55)) +
+  scale_color_manual(values = index_colors, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ dataset, nrow = 1) +
+  labs(
+    title = "Observed flagging rates exceed the nominal level almost everywhere",
+    subtitle = paste0("Dashed line is the nominal alpha = ", alpha),
+    x = NULL, y = "Flagged"
+  )
+```
+
+Every index in every table flags **more** than the nominal `r scales::percent(alpha)`, in several cases two to three times as often. Under the earlier pilot's framing this would have read as widespread aberrance. Section 4 shows it mostly is not.
+
+Note also that the 3PL flags *less* than the 1PL/2PL fairly consistently — the extra guessing parameter absorbs some of what the simpler models score as misfit.
+
+## 4. The bootstrap reference: is any of this real?
+
+This is the new engine's central capability. For each table, data are simulated from the working model's own estimated item parameters and WL ability estimates — data that are aberrance-free **by construction** — then recalibrated under the same model and rescored. The resulting flagging rate is the index's actual Type I error on data of exactly this shape.
+
+```{r}
+#| label: bootstrap-typeI
+
+pooled$bootstrap_typeI |>
+  mutate(Index = as_index(Index)) |>
+  select(dataset, Working_model, Index, Nominal_alpha,
+         N_successful_replicates, Mean_TypeI, SD_TypeI, Monte_Carlo_SE) |>
+  arrange(dataset, Index) |>
+  kable(
+    digits = 4,
+    caption = "Parametric bootstrap Type I error. Mean_TypeI is the average flagging rate across replicates of clean, model-generated data."
+  )
+```
+
+```{r}
+#| label: observed-vs-null
+
+observed_working <- pooled$flagging |>
+  filter(Model == working_model[dataset]) |>
+  select(dataset, Index, Percent_flagged)
+
+comparison <- pooled$bootstrap_typeI |>
+  select(dataset, Index, Mean_TypeI, Monte_Carlo_SE) |>
+  left_join(observed_working, by = c("dataset", "Index")) |>
+  mutate(
+    Observed = Percent_flagged / 100,
+    Bootstrap_null = Mean_TypeI,
+    Excess = Observed - Bootstrap_null,
+    Ratio = Observed / Bootstrap_null,
+    Index = as_index(Index)
+  )
+
+comparison |>
+  select(dataset, Index, Observed, Bootstrap_null, Excess, Ratio) |>
+  arrange(dataset, Index) |>
+  kable(
+    digits = 3,
+    caption = "Observed flagging rate vs. the bootstrap null, under each table's working model. Ratio > 1 means the index flags more in real data than it does on clean data of the same shape."
+  )
+```
+
+```{r}
+#| label: dumbbell
+#| fig-width: 9
+#| fig-height: 5.5
+
+comparison |>
+  ggplot(aes(y = Index)) +
+  geom_vline(xintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_segment(aes(x = Bootstrap_null, xend = Observed, yend = Index),
+               color = "#c3c2b7", linewidth = 1.4) +
+  geom_point(aes(x = Bootstrap_null), color = "#7a7975", size = 2.8) +
+  geom_point(aes(x = Observed, color = Index), size = 3.2) +
+  scale_color_manual(values = index_colors, guide = "none") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ dataset, nrow = 1) +
+  labs(
+    title = "Grey = bootstrap null rate, colored = observed rate",
+    subtitle = paste0("Dashed line is the nominal alpha = ", alpha,
+                      ". The gap between the two points is the part not explained by miscalibration."),
+    x = "Flagging rate", y = NULL
+  )
+```
+
+Two findings, and they point in different directions:
+
+**(a) The indices are miscalibrated, and the direction depends on the table.** On clean, model-generated data the indices should flag at exactly `r scales::percent(alpha)`. They do not:
+
+```{r}
+#| label: calibration-summary
+
+comparison |>
+  summarise(
+    `Min null rate` = min(Bootstrap_null),
+    `Median null rate` = median(Bootstrap_null),
+    `Max null rate` = max(Bootstrap_null),
+    .by = dataset
+  ) |>
+  kable(digits = 4, caption = "Bootstrap Type I error by table. Nominal is 0.05 throughout.")
+```
+
+`cdm_timss03`, the largest table, is close to nominal. The three smaller tables are **anti-conservative in the opposite direction** — they flag *less* than 5% on clean data, as low as 1.9% for ECI_Z2\* on `frac20`. The normal-theory reference distribution is a poor approximation at these test lengths, and the size of the error varies by index and by table. This is exactly the kind of confounding the earlier pilot could not detect, and it means **raw flagging rates are not comparable across tables**.
+
+**(b) There is still genuine excess after correcting for it.** Every observed rate exceeds its own bootstrap null:
+
+```{r}
+#| label: excess-summary
+
+comparison |>
+  summarise(
+    `Mean observed` = mean(Observed),
+    `Mean null` = mean(Bootstrap_null),
+    `Mean excess` = mean(Excess),
+    `Median ratio` = median(Ratio),
+    .by = Index
+  ) |>
+  arrange(Index) |>
+  kable(digits = 3, caption = "Pooled across the four tables, by index.")
+```
+
+The excess is real but a lot smaller than the raw rates implied: a median ratio of 1.7–2.3, not the 2–3× that reading the observed rates against a nominal 5% would have suggested. Roughly half of the apparent misfit in these tables is an artifact of index miscalibration rather than aberrant respondents.
+
+With `r settings$bootstrap_reps` replicates the Monte Carlo SE is about `r round(mean(pooled$bootstrap_typeI$Monte_Carlo_SE), 4)`, small relative to the gaps being interpreted, so the qualitative conclusions are not replicate-limited. A larger sweep should still use more replicates for the per-table numbers.
+
+## 5. Does the choice of IRT model change who is flagged?
+
+The engine scores every respondent under all three models, so this is directly measurable — score correlations, and the agreement of the binary flag decisions.
+
+```{r}
+#| label: stability-table
+
+pooled$model_stability |>
+  mutate(Index = as_index(Index),
+         Pair = paste(Model_1, "vs", Model_2)) |>
+  select(dataset, Pair, Index, Pearson_r, Spearman_r,
+         Agreement_rate, Percent_changed, Cohen_kappa) |>
+  arrange(dataset, Pair, Index) |>
+  kable(digits = 3, caption = "Cross-model stability of scores and flags, per table.")
+```
+
+```{r}
+#| label: stability-plot
+#| fig-width: 9
+#| fig-height: 4.5
+
+pooled$model_stability |>
+  mutate(Index = as_index(Index),
+         Pair = factor(paste(Model_1, "vs", Model_2),
+                       levels = c("1PL vs 2PL", "1PL vs 3PL", "2PL vs 3PL"))) |>
+  ggplot(aes(x = Pair, y = Cohen_kappa, color = Index)) +
+  geom_hline(yintercept = 1, linetype = "dotted", color = "#c3c2b7") +
+  geom_point(size = 2.8, position = position_dodge(width = 0.6)) +
+  scale_color_manual(values = index_colors) +
+  scale_y_continuous(limits = c(0, 1)) +
+  facet_wrap(~ dataset, nrow = 1) +
+  labs(
+    title = "Flag agreement across IRT models (Cohen's kappa)",
+    subtitle = "Perfect agreement = 1. Adjacent models agree well; 1PL vs 3PL does not.",
+    x = NULL, y = "Cohen's kappa"
+  )
+```
+
+```{r}
+#| label: stability-by-pair
+
+pooled$model_stability |>
+  mutate(Pair = paste(Model_1, "vs", Model_2)) |>
+  summarise(
+    `Median Pearson r` = median(Pearson_r, na.rm = TRUE),
+    `Median kappa` = median(Cohen_kappa, na.rm = TRUE),
+    `Median % flags changed` = median(Percent_changed, na.rm = TRUE),
+    .by = Pair
+  ) |>
+  kable(digits = 3, caption = "Pooled across tables and indices.")
+```
+
+Person-fit *scores* are highly stable across models (median Pearson $r$ around 0.95), but the *flag decisions* are noticeably less so, because flagging thresholds a continuous score and small shifts near the cutoff change membership. 1PL-vs-2PL agreement is strong; 1PL-vs-3PL is the weakest pair (median kappa 0.71 vs. 0.79), and individual table-by-index kappas fall as low as 0.36.
+
+This is a much better result than the earlier pilot's *between-index* agreement, which was near zero (median pairwise Jaccard of 0 for most index pairs). The interpretation is that **which index you pick matters far more than which IRT model you fit it under** — but the model choice is not free either, and it is the choice the earlier pilot made silently.
+
+## 6. Behavior conditional on ability
+
+Pooling over the whole θ range can hide the fact that an index misbehaves at the extremes, where a person-fit statistic has the least information to work with.
+
+```{r}
+#| label: ability-plot
+#| fig-width: 9
+#| fig-height: 6
+
+pooled$ability_conditional |>
+  filter(Model == working_model[dataset]) |>
+  mutate(Index = as_index(Index)) |>
+  ggplot(aes(x = Mean_theta, y = Percent_flagged / 100, color = Index)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(values = index_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ dataset, nrow = 2, scales = "free_x") +
+  labs(
+    title = "Flagging rate by ability quintile, under each table's working model",
+    subtitle = paste0("Dashed line is the nominal alpha = ", alpha),
+    x = expression(Mean~theta[WL]~within~bin), y = "Flagged"
+  )
+```
+
+```{r}
+#| label: ability-mean-pfs
+#| fig-width: 9
+#| fig-height: 6
+
+pooled$ability_conditional |>
+  filter(Model == working_model[dataset]) |>
+  mutate(Index = as_index(Index)) |>
+  ggplot(aes(x = Mean_theta, y = Mean_PFS, color = Index)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#52514e") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(values = index_colors) +
+  facet_wrap(~ dataset, nrow = 2, scales = "free_x") +
+  labs(
+    title = "Mean person-fit score by ability quintile",
+    subtitle = "A well-behaved index would sit flat at 0 across the range",
+    x = expression(Mean~theta[WL]~within~bin), y = "Mean score"
+  )
+```
+
+```{r}
+#| label: ability-extremes
+
+pooled$ability_conditional |>
+  filter(Model == working_model[dataset]) |>
+  mutate(Bin = case_when(
+    Ability_bin == 1 ~ "Lowest quintile",
+    Ability_bin == max(Ability_bin) ~ "Highest quintile",
+    TRUE ~ "Middle three"
+  )) |>
+  summarise(`Mean % flagged` = mean(Percent_flagged, na.rm = TRUE), .by = c(Index, Bin)) |>
+  pivot_wider(names_from = Bin, values_from = `Mean % flagged`) |>
+  mutate(Index = as_index(Index)) |>
+  arrange(Index) |>
+  select(Index, `Lowest quintile`, `Middle three`, `Highest quintile`) |>
+  kable(digits = 2, caption = "Flagging is not uniform across the ability range. Averaged over the four tables.")
+```
+
+Flagging is clearly **not** uniform across θ. The rate is depressed at the extremes and concentrated in the middle of the ability distribution — which is where a person-fit index has the most room to detect an unexpected response pattern, since at the extremes nearly all responses are predicted to go one way. A respondent's chance of being flagged therefore depends on where they sit on the trait, independent of how aberrant they actually are. Any downstream use of these flags — screening, exclusion, follow-up — inherits that bias.
+
+## 7. Empirical distributions
+
+All five indices are constructed to be asymptotically standard normal, which is what the flagging cutoff assumes.
+
+```{r}
+#| label: distributions-table
+
+pooled$distributions |>
+  mutate(Model = as_model(Model), Index = as_index(Index)) |>
+  select(dataset, Model, Index, N_valid, Mean, SD, Skewness, Excess_kurtosis) |>
+  arrange(dataset, Model, Index) |>
+  kable(digits = 3, caption = "Moments of each index, every table x model.")
+```
+
+```{r}
+#| label: distributions-summary
+
+pooled$distributions |>
+  filter(Model == working_model[dataset]) |>
+  mutate(Index = as_index(Index)) |>
+  summarise(
+    `Mean of means` = mean(Mean),
+    `Mean SD` = mean(SD),
+    `Mean skewness` = mean(Skewness),
+    `Mean excess kurtosis` = mean(Excess_kurtosis),
+    .by = Index
+  ) |>
+  arrange(Index) |>
+  kable(digits = 3, caption = "Under each table's working model. N(0,1) would be 0, 1, 0, 0.")
+```
+
+```{r}
+#| label: distribution-hist
+#| fig-width: 9
+#| fig-height: 6
+
+score_cols <- c(lzstar = "lz*", U_star = "U*", W_star = "W*",
+                ECI_Z2_star = "ECI_Z2*", ECI_Z4_star = "ECI_Z4*")
+
+pooled$person_fit |>
+  filter(Model == working_model[dataset]) |>
+  select(dataset, all_of(names(score_cols))) |>
+  pivot_longer(-dataset, names_to = "col", values_to = "value") |>
+  filter(is.finite(value)) |>
+  mutate(Index = as_index(unname(score_cols[col]))) |>
+  ggplot(aes(x = value, fill = Index)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, color = "white", linewidth = 0.15) +
+  stat_function(fun = dnorm, color = "#0b0b0b", linetype = "dashed", linewidth = 0.6) +
+  geom_vline(xintercept = qnorm(alpha), color = "#52514e", linewidth = 0.4) +
+  scale_fill_manual(values = index_colors, guide = "none") +
+  facet_wrap(~ Index, nrow = 2, scales = "free_y") +
+  coord_cartesian(xlim = c(-6, 6)) +
+  labs(
+    title = "Pooled empirical distributions vs. the assumed N(0,1)",
+    subtitle = paste0("Dashed curve is N(0,1); vertical line is the lower cutoff at alpha = ", alpha),
+    x = "Score", y = "Density"
+  )
+```
+
+The SDs run at or above 1 throughout (1.0–1.5, mostly 1.3–1.4), which alone would produce over-flagging in both tails, and the distributions are visibly skewed — lz\* left-skewed, U\* strongly right-skewed with heavy excess kurtosis. The normal approximation is not good at these test lengths, which is the mechanism behind the miscalibration the bootstrap measured in Section 4.
+
+Note that the direction is not obvious: an SD above 1 pushes toward over-flagging, but the bootstrap found *under*-flagging on clean data in three of four tables. Skewness pulls the other way, and in the observed data the two effects do not cancel the same way they do in simulation. This is the argument for keeping the bootstrap rather than trying to reason from moments.
+
+## 8. Verdict
+
+The proof of concept works. Four for four tables completed, all three models calibrated in every case, and all six analysis tables populated.
+
+What the new engine adds that the earlier pilot could not do:
+
+- **The bootstrap is the main gain.** It converts an uninterpretable "10% flagged" into "10% observed against a 5% nominal but a 3% actual null, so roughly a 3× excess" — and it shows the null rate varies enough between tables that raw rates should not be compared directly.
+- **The 3PL was the wrong default.** BIC never prefers it in these four tables. Fixing the model in advance was a real, unexamined choice.
+- **Model choice moves the flagged set** by a median of 2–4% of respondents, and by considerably more in the worst table-index combinations. Less than the choice of index does, but not negligible.
+- **Ability conditioning shows flagging is θ-dependent**, concentrated in the middle of the distribution. This is a bias in any downstream use of the flags and is invisible in a pooled summary.
+
+Issues to settle before expanding:
+
+1. **No mirt fallback.** The engine uses irtoys/ltm only, and now needs *three* models rather than one, so more failure surface. Six tables failed in the earlier pilot; they will likely still fail. Worth porting the `fit_3PL_with_fallback()` logic from `person_fit_compute.R`, or at least confirming which of the three models fail per table rather than dropping the table.
+2. **Complete-data requirement.** `irtoys::est()` rejects missing data, so incomplete tables need complete-case deletion — which is not a neutral operation when missingness is related to ability. Two pilot tables (`psychtools_ability` at 0.97 density, `experimental_iq` at 0.95) are affected; `dscore_barrera_weber_2019` at 0.24 density is unusable this way.
+3. **Bootstrap cost.** At `r settings$bootstrap_reps` replicates this run took `r round(sum(manifest$elapsed_secs)/60, 1)` minutes for four tables. Scaling to 18 tables at 200 replicates is roughly 3–4 hours single-threaded. The replicate loop is embarrassingly parallel and should be run under `future`/`furrr`, as the earlier pipeline already loads.
+4. **`Ht` was dropped.** If it should stay, it needs to be added back to `compute_pfs_one_model()`.
+5. **AIC and BIC disagree** on the working model. Since the working model determines the bootstrap reference, this choice propagates. Worth reporting both, or fixing on BIC and stating why.
+
+## Appendix A. Bootstrap replicate spread
+
+Section 4 reported the mean flagging rate across bootstrap replicates. This is the full replicate-level distribution behind those means, which shows how tightly the null rate is pinned down at `r settings$bootstrap_reps` replicates.
+
+```{r}
+#| label: bootstrap-spread
+#| fig-width: 9
+#| fig-height: 5
+
+pooled$bootstrap_details |>
+  filter(is.finite(Flag_rate)) |>
+  mutate(Index = as_index(Index)) |>
+  ggplot(aes(x = Flag_rate, y = Index, color = Index)) +
+  geom_vline(xintercept = alpha, linetype = "dashed", color = "#52514e") +
+  geom_jitter(height = 0.18, alpha = 0.35, size = 1.1) +
+  stat_summary(fun = mean, geom = "point", size = 3.2, color = "#0b0b0b") +
+  scale_color_manual(values = index_colors, guide = "none") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ dataset, nrow = 1) +
+  labs(
+    title = "Flagging rate on clean, model-generated data, one point per replicate",
+    subtitle = paste0("Black point is the mean; dashed line is the nominal alpha = ", alpha),
+    x = "Flagging rate", y = NULL
+  )
+```
+
+```{r}
+#| label: bootstrap-quantiles
+
+pooled$bootstrap_details |>
+  filter(is.finite(Flag_rate)) |>
+  mutate(Index = as_index(Index)) |>
+  summarise(
+    N_replicates = n(),
+    Min = min(Flag_rate),
+    Q25 = quantile(Flag_rate, 0.25),
+    Median = median(Flag_rate),
+    Q75 = quantile(Flag_rate, 0.75),
+    Max = max(Flag_rate),
+    .by = c(dataset, Index)
+  ) |>
+  arrange(dataset, Index) |>
+  kable(digits = 4, caption = "Replicate-level quantiles of the bootstrap null flagging rate.")
+```
+
+No replicate failed to recalibrate in any table, so every null rate rests on the full `r settings$bootstrap_reps` replicates.
+
+## Appendix B. Estimated item parameters
+
+The full calibration underlying everything above, for all three models in all four tables.
+
+```{r}
+#| label: item-parameter-summary
+
+pooled$item_parameters |>
+  mutate(Model = as_model(Model)) |>
+  summarise(
+    N_items = n(),
+    `Mean a` = mean(a), `SD a` = sd(a),
+    `Mean b` = mean(b), `SD b` = sd(b),
+    `Mean c` = mean(c), `Max c` = max(c),
+    .by = c(dataset, Model)
+  ) |>
+  arrange(dataset, Model) |>
+  kable(digits = 3, caption = "Item-parameter summaries. Under the 1PL and 2PL, c is fixed at 0; under the 1PL, a is common across items.")
+```
+
+```{r}
+#| label: item-parameter-plot
+#| fig-width: 9
+#| fig-height: 5
+
+pooled$item_parameters |>
+  mutate(Model = as_model(Model)) |>
+  ggplot(aes(x = b, y = a, color = Model)) +
+  geom_point(size = 1.9, alpha = 0.8) +
+  scale_color_manual(values = model_colors) +
+  facet_wrap(~ dataset, nrow = 1, scales = "free") +
+  labs(
+    title = "Discrimination against difficulty, by model",
+    subtitle = "The 3PL trades a higher guessing parameter for shifted difficulty and discrimination",
+    x = "b (difficulty)", y = "a (discrimination)"
+  )
+```
+
+```{r}
+#| label: item-parameters-full
+
+pooled$item_parameters |>
+  mutate(Model = as_model(Model)) |>
+  arrange(dataset, Model, Item) |>
+  kable(digits = 3, caption = "Every estimated item parameter, all tables and models.")
+```
+
+## Appendix C. Person-level scores
+
+Person-level scores for all `r format(nrow(pooled$person_fit), big.mark = ",")` table-by-model-by-person rows are cached in `persondata_v2/pooled_results.rds` (component `person_fit`) and written per table as `persondata_v2/<table>_personfit/person_fit_scores_all_models.csv`. They are summarised rather than printed here, since the full listing would run to thousands of rows.
+
+```{r}
+#| label: person-fit-head
+
+pooled$person_fit |>
+  filter(Model == working_model[dataset]) |>
+  summarise(
+    N_persons = n(),
+    `Mean theta` = mean(theta_WL),
+    `SD theta` = sd(theta_WL),
+    `Min theta` = min(theta_WL),
+    `Max theta` = max(theta_WL),
+    `Flagged by >=1 index` = sum(
+      lzstar_flag | U_star_flag | W_star_flag |
+        ECI_Z2_star_flag | ECI_Z4_star_flag,
+      na.rm = TRUE
+    ),
+    `Flagged by all 5` = sum(
+      lzstar_flag & U_star_flag & W_star_flag &
+        ECI_Z2_star_flag & ECI_Z4_star_flag,
+      na.rm = TRUE
+    ),
+    .by = dataset
+  ) |>
+  kable(digits = 3, caption = "Person-level summary under each table's working model. The gap between 'flagged by at least one' and 'flagged by all five' is another view of how little the indices agree with each other.")
+```
+
+Worth pausing on: **not one respondent, in any of the four tables, is flagged by all five indices.** Between 15% and 24% of respondents are flagged by at least one. Whatever these five statistics are each detecting, it is not a shared underlying "aberrance" that they merely measure with different amounts of noise — the July pilot's near-zero between-index Jaccard shows up here in its starkest form. A study that reports "respondents flagged for misfit" without naming the index is reporting an artifact of that choice.
+
+```{r}
+#| label: person-fit-preview
+
+pooled$person_fit |>
+  filter(Model == working_model[dataset]) |>
+  slice_head(n = 10, by = dataset) |>
+  select(dataset, Person, Model, theta_WL,
+         lzstar, U_star, W_star, ECI_Z2_star, ECI_Z4_star) |>
+  kable(digits = 3, caption = "First ten persons per table, as a format preview of the cached person-level output.")
+```
+
+## Session information
+
+```{r}
+#| label: session
+
+sessionInfo()
+```

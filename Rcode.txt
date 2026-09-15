@@ -1,0 +1,503 @@
+#############################################################
+# PERSON-FIT STATISTICS UNDER THE 3PL MODEL
+# Item calibration outside mirt:
+#   - 3PL item parameters: irtoys::est(..., engine = "ltm")
+#   - theta estimates: irtoys::wle()
+#
+# Indices:
+#   lz*
+#   U*
+#   W*
+#   ECI_Z2*
+#   ECI_Z4*
+#   Ht
+
+#############################################################
+
+
+# ============================================================
+# NEEDED PACKAGES
+# ============================================================
+
+library(ltm)
+library(irtoys)
+library(PerFit)
+library(aberrance)
+
+
+# ============================================================
+# 1. ESTIMATE 3PL ITEM PARAMETERS WITH IRTOYS/LTM
+# ============================================================
+
+set.seed(123)
+
+fit_3PL <- irtoys::est(
+  resp = X,
+  model = "3PL",
+  engine = "ltm"
+)
+
+IP_3PL <- as.matrix(fit_3PL$est)
+
+if (ncol(IP_3PL) != 3L) {
+  stop("The item-parameter matrix does not contain three columns.")
+}
+
+colnames(IP_3PL) <- c("a", "b", "c")
+
+if (!is.null(colnames(X))) {
+  rownames(IP_3PL) <- colnames(X)
+}
+
+if (anyNA(IP_3PL) || any(!is.finite(IP_3PL))) {
+  stop(
+    paste0(
+      "The 3PL calibration returned missing or non-finite item parameters. ",
+      "Inspect fit_3PL and consider whether the 3PL is stable for these data."
+    )
+  )
+}
+
+print(head(IP_3PL))
+
+
+# ============================================================
+# 2. ESTIMATE THETA BY WEIGHTED LIKELIHOOD
+# ============================================================
+
+theta_object <- irtoys::wle(
+  resp = X,
+  ip = IP_3PL
+)
+
+theta_WL <- as.numeric(theta_object[, 1])
+
+if (length(theta_WL) != nrow(X)) {
+  stop("The number of theta estimates does not equal the number of persons.")
+}
+
+if (anyNA(theta_WL) || any(!is.finite(theta_WL))) {
+  warning(
+    "Some WL ability estimates are missing or non-finite. ",
+    "The corresponding person-fit values may also be missing."
+  )
+}
+
+xi_3PL <- matrix(
+  theta_WL,
+  ncol = 1,
+  dimnames = list(rownames(X), "theta")
+)
+
+
+# ============================================================
+# 3. FUNCTIONS TO COMPUTE U* AND W*
+# ============================================================
+
+Pi_3PL <- function(theta, item_parameters) {
+
+  a <- item_parameters[, 1]
+  b <- item_parameters[, 2]
+  c <- item_parameters[, 3]
+
+  logistic_part <- plogis(a * (theta - b))
+
+  probability <- c + (1 - c) * logistic_part
+
+  first_derivative <-
+    (1 - c) *
+    a *
+    logistic_part *
+    (1 - logistic_part)
+
+  second_derivative <-
+    (1 - c) *
+    a^2 *
+    logistic_part *
+    (1 - logistic_part) *
+    (1 - 2 * logistic_part)
+
+  probability <- pmin(
+    pmax(probability, 1e-10),
+    1 - 1e-10
+  )
+
+  list(
+    Pi = probability,
+    dPi = first_derivative,
+    d2Pi = second_derivative
+  )
+}
+
+
+ri_3PL <- function(theta, item_parameters) {
+
+  values <- Pi_3PL(theta, item_parameters)
+
+  values$dPi /
+    (values$Pi * (1 - values$Pi))
+}
+
+
+r0_WL <- function(theta, item_parameters) {
+
+  values <- Pi_3PL(theta, item_parameters)
+  r_values <- ri_3PL(theta, item_parameters)
+
+  denominator <- 2 * sum(r_values * values$dPi)
+
+  if (!is.finite(denominator) || abs(denominator) < 1e-12) {
+    return(NA_real_)
+  }
+
+  sum(r_values * values$d2Pi) / denominator
+}
+
+
+item_weights <- function(theta, item_parameters, index) {
+
+  index <- match.arg(index, c("lz", "U", "W"))
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+  J <- nrow(item_parameters)
+
+  switch(
+    index,
+
+    lz = log(probability / (1 - probability)),
+
+    U = (1 - 2 * probability) /
+      (J * probability * (1 - probability)),
+
+    W = (1 - 2 * probability) /
+      sum(probability * (1 - probability))
+  )
+}
+
+
+Wn <- function(response_vector, theta, item_parameters, index) {
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+
+  weights <- item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  sum((response_vector - probability) * weights)
+}
+
+
+cn <- function(theta, item_parameters, index) {
+
+  values <- Pi_3PL(theta, item_parameters)
+
+  weights <- item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  numerator <- sum(values$dPi * weights)
+  denominator <- sum(values$dPi * ri_3PL(theta, item_parameters))
+
+  if (!is.finite(denominator) || abs(denominator) < 1e-12) {
+    return(NA_real_)
+  }
+
+  numerator / denominator
+}
+
+
+corrected_weights <- function(theta, item_parameters, index) {
+
+  correction <- cn(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  if (!is.finite(correction)) {
+    return(rep(NA_real_, nrow(item_parameters)))
+  }
+
+  item_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  ) -
+    correction * ri_3PL(theta, item_parameters)
+}
+
+
+tau2n <- function(theta, item_parameters, index) {
+
+  probability <- Pi_3PL(theta, item_parameters)$Pi
+
+  weights <- corrected_weights(
+    theta = theta,
+    item_parameters = item_parameters,
+    index = index
+  )
+
+  if (anyNA(weights)) {
+    return(NA_real_)
+  }
+
+  sum(
+    weights^2 *
+      probability *
+      (1 - probability)
+  ) / nrow(item_parameters)
+}
+
+
+compute_corrected_index <- function(
+    data,
+    item_parameters,
+    theta,
+    index = c("U", "W")) {
+
+  index <- match.arg(index)
+
+  corrected_index <- rep(NA_real_, nrow(data))
+
+  for (person in seq_len(nrow(data))) {
+
+    th <- theta[person]
+
+    if (!is.finite(th)) {
+      next
+    }
+
+    correction_c <- cn(
+      theta = th,
+      item_parameters = item_parameters,
+      index = index
+    )
+
+    bias_WL <- r0_WL(
+      theta = th,
+      item_parameters = item_parameters
+    )
+
+    expected_corrected <- -correction_c * bias_WL
+
+    variance_corrected <-
+      nrow(item_parameters) *
+      tau2n(
+        theta = th,
+        item_parameters = item_parameters,
+        index = index
+      )
+
+    observed_value <- Wn(
+      response_vector = data[person, ],
+      theta = th,
+      item_parameters = item_parameters,
+      index = index
+    )
+
+    if (
+      is.finite(expected_corrected) &&
+      is.finite(variance_corrected) &&
+      variance_corrected > 0
+    ) {
+      corrected_index[person] <-
+        (observed_value - expected_corrected) /
+        sqrt(variance_corrected)
+    }
+  }
+
+  corrected_index
+}
+
+
+# ============================================================
+# 4. COMPUTE lz* FROM PERFIT
+# ============================================================
+
+result_lzstar <- PerFit::lzstar(
+  matrix = X,
+  IP = IP_3PL,
+  IRT.PModel = "3PL",
+  Ability = theta_WL,
+  Ability.PModel = "WL"
+)
+
+lzstar_scores <- as.numeric(
+  unlist(result_lzstar$PFscores)
+)
+
+
+# ============================================================
+# 5. COMPUTE Ht FROM PERFIT
+# ============================================================
+
+result_Ht <- PerFit::Ht(
+  matrix = X
+)
+
+Ht_scores <- as.numeric(
+  unlist(result_Ht$PFscores)
+)
+
+
+# ============================================================
+# 6. COMPUTE ECI_Z2* AND ECI_Z4* FROM ABERRANT
+# ============================================================
+
+result_ECI <- aberrance::detect_pm(
+  method = c(
+    "ECI2_S_TS",
+    "ECI4_S_TS"
+  ),
+  psi = IP_3PL,
+  xi = xi_3PL,
+  x = X,
+  alpha = 0.01
+)
+
+ECI_Z2_star <- as.numeric(
+  result_ECI$stat[, "ECI2_S_TS"]
+)
+
+ECI_Z4_star <- as.numeric(
+  result_ECI$stat[, "ECI4_S_TS"]
+)
+
+
+# ============================================================
+# 7. COMPUTE U* AND W* FROM ^PERSONNAL R CODE
+# ============================================================
+
+U_star_scores <- compute_corrected_index(
+  data = X,
+  item_parameters = IP_3PL,
+  theta = theta_WL,
+  index = "U"
+)
+
+W_star_scores <- compute_corrected_index(
+  data = X,
+  item_parameters = IP_3PL,
+  theta = theta_WL,
+  index = "W"
+)
+
+
+# ============================================================
+# 8. COMBINE RESULTS
+# ============================================================
+
+if (
+  exists("Person_ID", inherits = TRUE) &&
+  length(Person_ID) == nrow(X)
+) {
+  respondent_ID <- Person_ID
+} else if (!is.null(rownames(X))) {
+  respondent_ID <- rownames(X)
+} else {
+  respondent_ID <- seq_len(nrow(X))
+}
+
+person_fit_results <- data.frame(
+  Person = respondent_ID,
+  theta_WL = theta_WL,
+  lzstar = lzstar_scores,
+  U_star = U_star_scores,
+  W_star = W_star_scores,
+  ECI_Z2_star = ECI_Z2_star,
+  ECI_Z4_star = ECI_Z4_star,
+  Ht = Ht_scores,
+  check.names = FALSE
+)
+
+print(head(person_fit_results))
+
+
+# ============================================================
+# 9. FLAGGING AT THE 1% LEVEL
+# ============================================================
+
+alpha <- 0.01
+normal_cutoff <- qnorm(alpha)
+
+person_fit_results$lzstar_flag <-
+  person_fit_results$lzstar < normal_cutoff
+
+person_fit_results$U_star_flag <-
+  person_fit_results$U_star < normal_cutoff
+
+person_fit_results$W_star_flag <-
+  person_fit_results$W_star < normal_cutoff
+
+person_fit_results$ECI_Z2_star_flag <-
+  person_fit_results$ECI_Z2_star < normal_cutoff
+
+person_fit_results$ECI_Z4_star_flag <-
+  person_fit_results$ECI_Z4_star < normal_cutoff
+
+
+# Ht uses a simulated empirical cutoff.
+set.seed(123)
+
+Ht_cutoff_object <- PerFit::cutoff(
+  x = result_Ht,
+  ModelFit = "NonParametric",
+  Nreps = 1000,
+  Blvl = alpha,
+  Breps = 1000
+)
+
+Ht_cutoff <- as.numeric(Ht_cutoff_object$Cutoff)[1]
+
+person_fit_results$Ht_flag <-
+  person_fit_results$Ht <= Ht_cutoff
+
+
+# ============================================================
+# 10. SUMMARY
+# ============================================================
+
+score_names <- c(
+  "lzstar",
+  "U_star",
+  "W_star",
+  "ECI_Z2_star",
+  "ECI_Z4_star",
+  "Ht"
+)
+
+flag_names <- paste0(score_names, "_flag")
+
+flag_summary <- data.frame(
+  Index = c(
+    "lz*",
+    "U*",
+    "W*",
+    "ECI_Z2*",
+    "ECI_Z4*",
+    "Ht"
+  ),
+  N_valid = vapply(
+    person_fit_results[score_names],
+    function(z) sum(!is.na(z)),
+    FUN.VALUE = integer(1)
+  ),
+  N_flagged = vapply(
+    person_fit_results[flag_names],
+    function(z) sum(z, na.rm = TRUE),
+    FUN.VALUE = integer(1)
+  )
+)
+
+flag_summary$Percent_flagged <- round(
+  100 * flag_summary$N_flagged / flag_summary$N_valid,
+  2
+)
+
+print(flag_summary)
+
+

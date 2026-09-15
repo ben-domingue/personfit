@@ -1,0 +1,34 @@
+# R session artifacts
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Quarto / knitr render byproducts
+.quarto/
+*_files/
+*_cache/
+/.luarc.json
+
+# Scratch renders
+*_interim*.html
+
+# Credentials / environment
+.Renviron
+.env
+*.token
+.httr-oauth
+
+# OS / editor / sync clutter
+.DS_Store
+Thumbs.db
+*~
+*.swp
+.dropbox
+.dropbox.attr
+
+# Raw computed outputs (rds caches, per-dataset CSVs) — regenerate from compute scripts
+persondata/
+persondata_v2/
+archive_*/persondata*/

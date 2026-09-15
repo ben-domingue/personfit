@@ -1,0 +1,403 @@
+---
+title: "Person-Fit Statistics Under the 3PL: A Pilot Study Across IRW Datasets"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: show
+    df-print: kable
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+This page extends single-dataset person-fit analysis to a pilot set of real, dichotomous [Item Response Warehouse](https://itemresponsewarehouse.org/) (IRW) datasets, calibrated under the 3PL model. For each respondent in each dataset we compute six person-fit indices — lz\*, U\*, W\*, ECI_Z2\*, ECI_Z4\*, and Ht — and flag misfitting respondents at $\alpha = 0.05$. The goal is to characterize (1) whether the 3PL is actually preferred over the simpler 2PL for these datasets, (2) how often each index flags respondents, (3) how much the six indices agree on *which* respondents are flagged, (4) whether flagging rates are confounded with dataset structure (number of items, number of respondents, response density) rather than reflecting "real" aberrance, and (5) what the pooled empirical distribution of each index looks like across the pilot.
+
+All heavy computation (data fetch, 3PL calibration, person-fit scoring) happens in the companion script [`person_fit_compute.R`](person_fit_compute.R) and is cached to `persondata/`. This page only loads the cached results.
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(knitr)
+
+person_fit_results <- readRDS("persondata/person_fit_results.rds")
+skipped_datasets <- readRDS("persondata/skipped_datasets.rds")
+model_comparison_results <- readRDS("persondata/model_comparison_results.rds")
+alpha <- readRDS("persondata/alpha.rds")
+
+score_names <- c("lzstar", "U_star", "W_star", "ECI_Z2_star", "ECI_Z4_star", "Ht")
+flag_names <- paste0(score_names, "_flag")
+index_labels <- c(
+  lzstar = "lz*", U_star = "U*", W_star = "W*",
+  ECI_Z2_star = "ECI_Z2*", ECI_Z4_star = "ECI_Z4*", Ht = "Ht"
+)
+
+# categorical palette (fixed slot order; see dataviz color-formula)
+index_colors <- c(
+  "lz*"      = "#2a78d6",
+  "U*"       = "#eb6834",
+  "W*"       = "#1baf7a",
+  "ECI_Z2*"  = "#eda100",
+  "ECI_Z4*"  = "#e87ba4",
+  "Ht"       = "#008300"
+)
+
+theme_pf <- theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#e1e0d9"),
+    axis.line = element_line(color = "#c3c2b7"),
+    text = element_text(color = "#0b0b0b"),
+    axis.text = element_text(color = "#52514e"),
+    strip.text = element_text(face = "bold"),
+    plot.title.position = "plot"
+  )
+theme_set(theme_pf)
+
+n_ok <- n_distinct(person_fit_results$dataset)
+n_skipped <- nrow(skipped_datasets)
+```
+
+## Pilot overview
+
+`r n_ok` of `r n_ok + n_skipped` pilot datasets produced usable person-fit results; `r n_skipped` were skipped due to 3PL calibration failure (see [Skipped datasets](#skipped-datasets) below).
+
+```{r}
+#| label: dataset-table
+dataset_features <- person_fit_results |>
+  distinct(dataset, n_items, n_participants, density, engine)
+
+dataset_features |>
+  arrange(dataset) |>
+  kable(digits = 3, caption = "Datasets included in the pilot, with the 3PL engine that succeeded for each.")
+```
+
+`engine` records whether `ltm` (via `irtoys::est`) succeeded directly or whether the `mirt` fallback was needed.
+
+## 1. Does the pilot actually prefer the 3PL over the 2PL?
+
+Everything downstream assumes the 3PL is the right model. As a check, for each dataset we separately fit a 2PL (`ltm::ltm`) and a 3PL (`ltm::tpm`) on the same item matrix and compare them by AIC/BIC. This is a relative-fit comparison only (no likelihood-ratio test, since the 2PL sits on a boundary of the 3PL parameter space where guessing = 0), and it is independent of the ltm/mirt engine used for the person-fit calibration itself.
+
+```{r}
+#| label: model-comparison-summary
+
+model_comparison_wide <- model_comparison_results |>
+  select(dataset, Model, AIC, BIC) |>
+  pivot_wider(names_from = Model, values_from = c(AIC, BIC)) |>
+  mutate(
+    Preferred_by_AIC = if_else(AIC_3PL < AIC_2PL, "3PL", "2PL"),
+    Preferred_by_BIC = if_else(BIC_3PL < BIC_2PL, "3PL", "2PL")
+  )
+
+model_comparison_wide |>
+  count(Preferred_by_AIC, Preferred_by_BIC, name = "n_datasets") |>
+  kable(caption = "How many pilot datasets prefer the 3PL vs. the 2PL, by AIC and by BIC.")
+```
+
+```{r}
+#| label: model-comparison-table
+model_comparison_wide |>
+  arrange(dataset) |>
+  select(dataset, AIC_2PL, AIC_3PL, Preferred_by_AIC, BIC_2PL, BIC_3PL, Preferred_by_BIC) |>
+  kable(digits = 1, caption = "Per-dataset 2PL vs. 3PL comparison.")
+```
+
+## 2. How often does each index flag respondents?
+
+For each dataset and each index, we compute the percentage of respondents flagged at $\alpha = 0.05$. Under a perfectly calibrated model with no aberrant respondents, we'd expect roughly `r 100 * alpha`% flagged by chance for the indices using the normal-theory cutoff (dashed reference line); `Ht` uses a simulated empirical cutoff instead, so it is not expected to hit exactly `r 100 * alpha`%.
+
+```{r}
+#| label: flag-rates
+#| fig-width: 8
+#| fig-height: 5
+
+flag_long <- person_fit_results |>
+  select(dataset, all_of(flag_names)) |>
+  pivot_longer(all_of(flag_names), names_to = "index", values_to = "flag") |>
+  mutate(index = index_labels[sub("_flag$", "", index)])
+
+dataset_pct <- flag_long |>
+  group_by(dataset, index) |>
+  summarize(pct_flagged = 100 * mean(flag, na.rm = TRUE), n_valid = sum(!is.na(flag)), .groups = "drop")
+
+index_order <- dataset_pct |>
+  group_by(index) |>
+  summarize(med = median(pct_flagged, na.rm = TRUE)) |>
+  arrange(med) |>
+  pull(index)
+
+dataset_pct <- dataset_pct |> mutate(index = factor(index, levels = index_order))
+
+ggplot(dataset_pct, aes(index, pct_flagged, color = index)) +
+  geom_hline(yintercept = 100 * alpha, linetype = "dashed", color = "#898781") +
+  geom_boxplot(outlier.shape = NA, fill = NA, linewidth = 0.6) +
+  geom_jitter(width = 0.12, height = 0, alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = index_colors, guide = "none") +
+  labs(
+    x = NULL, y = "% of respondents flagged",
+    title = "Percentage of respondents flagged as misfitting, by index",
+    subtitle = sprintf("One point per pilot dataset; dashed line = %.0f%% (nominal alpha)", 100 * alpha)
+  )
+```
+
+```{r}
+#| label: flag-rate-table
+dataset_pct |>
+  group_by(index) |>
+  summarize(
+    median_pct = median(pct_flagged, na.rm = TRUE),
+    p25 = quantile(pct_flagged, 0.25, na.rm = TRUE),
+    p75 = quantile(pct_flagged, 0.75, na.rm = TRUE),
+    max_pct = max(pct_flagged, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(median_pct) |>
+  kable(digits = 2, caption = "Distribution of % flagged across pilot datasets, by index.")
+```
+
+## 3. Do the indices agree on *which* respondents are flagged?
+
+Raw flagging rates only say how many respondents each index flags, not whether the indices point at the same people. For each pair of indices, we compute the Jaccard index (|both flagged| / |flagged by either|) between their flagged-person sets *within* each dataset, then summarize the resulting distribution across datasets.
+
+```{r}
+#| label: jaccard-compute
+
+jaccard <- function(a, b) {
+  ok <- !is.na(a) & !is.na(b)
+  a <- a[ok]; b <- b[ok]
+  union_n <- sum(a | b)
+  if (union_n == 0) return(NA_real_)
+  sum(a & b) / union_n
+}
+
+index_pairs <- combn(flag_names, 2, simplify = FALSE)
+
+jaccard_by_dataset <- map_dfr(index_pairs, function(p) {
+  person_fit_results |>
+    group_by(dataset) |>
+    summarize(jaccard = jaccard(.data[[p[1]]], .data[[p[2]]]), .groups = "drop") |>
+    mutate(
+      index1 = index_labels[sub("_flag$", "", p[1])],
+      index2 = index_labels[sub("_flag$", "", p[2])]
+    )
+})
+
+jaccard_summary <- jaccard_by_dataset |>
+  group_by(index1, index2) |>
+  summarize(
+    median_jaccard = median(jaccard, na.rm = TRUE),
+    n_datasets = sum(!is.na(jaccard)),
+    .groups = "drop"
+  )
+
+# symmetric matrix incl. diagonal, for the heatmap
+jaccard_full <- bind_rows(
+  jaccard_summary,
+  jaccard_summary |> rename(index1 = index2, index2 = index1),
+  tibble(index1 = index_labels, index2 = index_labels, median_jaccard = 1, n_datasets = NA)
+)
+jaccard_full$index1 <- factor(jaccard_full$index1, levels = index_labels)
+jaccard_full$index2 <- factor(jaccard_full$index2, levels = index_labels)
+```
+
+```{r}
+#| label: jaccard-heatmap
+#| fig-width: 6.5
+#| fig-height: 5.5
+
+ggplot(jaccard_full, aes(index1, index2, fill = median_jaccard)) +
+  geom_tile(color = "#fcfcfb", linewidth = 1) +
+  geom_text(aes(label = ifelse(is.na(median_jaccard), "", sprintf("%.2f", median_jaccard))),
+            color = "#0b0b0b", size = 3.4) +
+  scale_fill_gradientn(
+    colors = c("#cde2fb", "#6da7ec", "#2a78d6", "#184f95"),
+    limits = c(0, 1), na.value = "#f0efec", name = "Median\nJaccard"
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    title = "Pairwise agreement between person-fit indices on WHO gets flagged",
+    subtitle = "Median Jaccard index across pilot datasets (1 = perfect overlap, 0 = no overlap)"
+  ) +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+#| label: jaccard-table
+jaccard_summary |>
+  arrange(desc(median_jaccard)) |>
+  kable(digits = 2, caption = "Median pairwise Jaccard agreement across pilot datasets, by index pair.")
+```
+
+## 4. Is flagging rate confounded with dataset structure?
+
+If an index's flagging rate systematically tracks the number of items, number of respondents, or response density, that's a sign the index isn't purely picking up "real" aberrance — it may instead reflect estimation noise that varies with test/sample size.
+
+```{r}
+#| label: structure-scatter
+#| fig-width: 9
+#| fig-height: 8
+
+dataset_summary <- dataset_pct |>
+  left_join(dataset_features, by = "dataset")
+
+feature_long <- dataset_summary |>
+  pivot_longer(
+    cols = c(n_items, n_participants, density),
+    names_to = "feature", values_to = "value"
+  ) |>
+  mutate(feature = recode(feature,
+    n_items = "N items", n_participants = "N participants", density = "Density"
+  ))
+
+ggplot(feature_long, aes(value, pct_flagged, color = index)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.7) +
+  scale_color_manual(values = index_colors, guide = "none") +
+  facet_grid(index ~ feature, scales = "free_x") +
+  labs(
+    x = NULL, y = "% flagged",
+    title = "Dataset-level flagging rate vs. structural features"
+  )
+```
+
+```{r}
+#| label: structure-cor-table
+
+cor_table <- feature_long |>
+  group_by(index, feature) |>
+  summarize(
+    r = suppressWarnings(cor(value, pct_flagged, use = "complete.obs")),
+    .groups = "drop"
+  ) |>
+  pivot_wider(names_from = feature, values_from = r)
+
+cor_table |> kable(digits = 2, caption = "Pearson correlation of % flagged with each structural feature, by index.")
+```
+
+## 5. Empirical distributions of the person-fit indices
+
+Pooling every respondent from every successfully calibrated dataset, what does the raw distribution of each index look like? This is purely descriptive (no reference distribution overlaid) and complements the flagging-rate view above, which only looks at the tail beyond the cutoff.
+
+```{r}
+#| label: empirical-descriptives
+
+empirical_skewness <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3L || sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+empirical_excess_kurtosis <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 4L || sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^4) / sd(x)^4 - 3
+}
+
+descriptive_statistics <- map_dfr(score_names, function(index_name) {
+  values <- person_fit_results[[index_name]]
+  values <- values[is.finite(values)]
+  data.frame(
+    Index = unname(index_labels[index_name]),
+    N_valid = length(values),
+    Mean = mean(values),
+    SD = sd(values),
+    Minimum = min(values),
+    Q1 = unname(quantile(values, 0.25)),
+    Median = median(values),
+    Q3 = unname(quantile(values, 0.75)),
+    Maximum = max(values),
+    Skewness = empirical_skewness(values),
+    Excess_kurtosis = empirical_excess_kurtosis(values)
+  )
+})
+
+descriptive_statistics |>
+  kable(digits = 2, caption = "Pooled empirical distribution of each index across all pilot respondents.")
+```
+
+```{r}
+#| label: empirical-quantiles
+
+quantile_probabilities <- c(0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+
+distribution_quantiles <- map_dfr(score_names, function(index_name) {
+  values <- person_fit_results[[index_name]]
+  values <- values[is.finite(values)]
+  data.frame(
+    Index = unname(index_labels[index_name]),
+    Percentile = 100 * quantile_probabilities,
+    Empirical_value = as.numeric(quantile(values, probs = quantile_probabilities, names = FALSE, type = 7))
+  )
+})
+
+distribution_quantiles |>
+  pivot_wider(names_from = Percentile, values_from = Empirical_value) |>
+  kable(digits = 2, caption = "Pooled empirical percentiles of each index across all pilot respondents.")
+```
+
+```{r}
+#| label: empirical-histograms
+#| fig-width: 9
+#| fig-height: 6
+
+score_long <- person_fit_results |>
+  select(all_of(score_names)) |>
+  pivot_longer(everything(), names_to = "index", values_to = "value") |>
+  filter(is.finite(value)) |>
+  mutate(index = factor(index_labels[index], levels = index_labels))
+
+ggplot(score_long, aes(value, fill = index)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.7) +
+  geom_density(color = "#0b0b0b", linewidth = 0.5) +
+  facet_wrap(~index, scales = "free", ncol = 3) +
+  scale_fill_manual(values = index_colors, guide = "none") +
+  labs(
+    x = NULL, y = "Density",
+    title = "Pooled empirical distribution of each person-fit index",
+    subtitle = "Across all respondents in all successfully calibrated pilot datasets"
+  )
+```
+
+## 6. Skipped datasets {#skipped-datasets}
+
+```{r}
+#| label: skipped-table
+if (nrow(skipped_datasets) == 0) {
+  cat("No pilot datasets were skipped -- 3PL calibration (via ltm or the mirt fallback) succeeded for all of them.")
+} else {
+  skipped_datasets |>
+    select(dataset, reason, n_items, n_participants, density) |>
+    kable(digits = 2, caption = "Pilot datasets skipped because both 3PL engines (ltm, mirt) failed.")
+}
+```
+
+## Interpretation
+
+**Model choice (Section 1).** If a sizable share of datasets prefer the 2PL over the 3PL by AIC/BIC, that's a caution flag on the whole exercise: the guessing parameter the 3PL adds (and that the person-fit math above depends on through `c`) may not be well identified for those datasets, making the downstream indices harder to trust there.
+
+**Flagging rates (Section 2).** lz\*, U\*, W\*, and the two ECI indices are anchored to the same $\alpha = 0.05$ normal-theory cutoff, so a well-behaved index should center near 5% flagged; systematic departures from that line indicate either genuine aberrance concentrated in these samples or a mismatch between the asymptotic normal reference distribution and the finite-sample behavior of the statistic. `Ht` uses a simulated empirical cutoff, so its level is calibrated by construction and mainly useful as a cross-check on relative respondent ranking rather than an absolute rate.
+
+**Agreement (Section 3).** The Jaccard heatmap is the more diagnostic result: two indices with similar flagging *rates* can still disagree substantially on *which* respondents are flagged if the underlying Jaccard is well below 1. Indices built on closely related math (e.g. the corrected U\*/W\* pair, or the two ECI variants) are expected to cluster; agreement across families (e.g. lz\* vs. Ht, which uses a nonparametric definition of misfit) is the more informative comparison.
+
+**Structural confounding (Section 4).** Any index whose flagging rate trends strongly with `n_items`, `n_participants`, or `density` should be interpreted cautiously in cross-dataset comparisons, since part of its signal reflects test/sample structure rather than respondent-level aberrance.
+
+**Pooled distributions (Section 5).** The histograms and skewness/kurtosis figures describe the raw shape of each index pooled across the pilot; heavy left skew or excess kurtosis beyond what the (approximately normal) reference distribution predicts is a further sign of finite-sample departure from the asymptotic theory the cutoffs rely on.
+
+## Scouting verdict
+
+::: {.callout-note collapse="false"}
+This is a scouting run intended to establish whether the pilot set produces a clean, interpretable result before treating this as a finished vignette. Based on `r n_ok` successfully calibrated datasets (of `r n_ok + n_skipped` attempted): see the 2PL/3PL preference split in Section 1, the flag-rate spread in Section 2, the off-diagonal values in the Section 3 heatmap, and the calibration failure rate in Section 6 to judge whether (a) the 3PL is actually the right model for most of these datasets, (b) the indices disagree enough across datasets to be worth a larger sweep, and (c) 3PL calibration instability is a manageable fraction of the pilot or a fundamental obstacle to scaling this analysis up.
+:::
+
+## Reproducibility
+
+```{r}
+#| label: repro-footer
+cat("Rendered:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), "\n")
+sessionInfo()
+```
