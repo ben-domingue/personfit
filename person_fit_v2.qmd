@@ -207,6 +207,8 @@ This matters beyond model selection. The bootstrap in Sections 4–5 simulates f
 
 This section describes the observed flagging rates with the conventional cutoffs, broken down along every design dimension we have: test length, sample size, working model, analysis model and index.
 
+All of the flagging results used in Sections 3 and 4 are also written to [`persondata_v2/flag_results.csv`](persondata_v2/flag_results.csv), one row per table × analysis model × index × method, so the figures below can be reproduced from a single tidy file.
+
 ```{r}
 #| label: flag-long
 
@@ -219,52 +221,76 @@ flags <- pooled$calibrated_flagging |>
     Rate = Percent_flagged / 100,
     Working = paste("Working:", working_model)
   )
+
+# tidy export: one row per table x analysis model x index x method
+results <- flags |>
+  transmute(dataset, n_items, n_persons,
+            working_model = as_model(working_model),
+            analysis_model = Analysis_model,
+            statistic = Index, method = Method,
+            flagging_rate = Rate, null_rate = Null_rate,
+            working_acceptable_fit) |>
+  arrange(dataset, analysis_model, statistic, method)
+write.csv(results, "persondata_v2/flag_results.csv", row.names = FALSE)
+```
+
+Sections 3 and 4 use one figure template, laid out as working model (rows) × analysis model (columns) with one colour per statistic. Each point is a table. The lines join the mean flagging rate at each x value, which keeps them from zigzagging where two tables have the same test length; they connect tables and are not fitted trends. Every table appears in exactly one row, so the rows hold different tables and cannot be read as a common trend.
+
+```{r}
+#| label: plot-helper
+
+n_by_working <- results |>
+  distinct(dataset, working_model) |>
+  count(working_model)
+row_counts <- paste0(n_by_working$working_model, ": ", n_by_working$n, " tables",
+                     collapse = ", ")
+flag_caption <- paste0(
+  "Each point is one table \u00d7 analysis model \u00d7 statistic; ", nrow(ok),
+  " tables in all. Dashed line = nominal alpha.\n",
+  "Every table appears in exactly one row, so the rows hold different tables (",
+  row_counts, ") and rates are not comparable down a column.\n",
+  "Lines join the mean flagging rate at each x value; they connect tables and are not a fitted trend."
+)
+
+index_shapes <- c("lz*" = 16, "U*" = 17, "W*" = 15, "ECI_Z2*" = 18, "ECI_Z4*" = 8)
+
+plot_flags <- function(x_var, m, x_lab) {
+  d <- filter(results, method == m)
+  lines <- d |>
+    summarise(flagging_rate = mean(flagging_rate),
+              .by = c(working_model, analysis_model, statistic, {{ x_var }}))
+  ggplot(d, aes(x = {{ x_var }}, y = flagging_rate,
+                color = statistic, shape = statistic)) +
+    geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
+    geom_point(size = 1.8, alpha = 0.8) +
+    geom_line(data = lines, linewidth = 0.4) +
+    scale_color_manual(values = index_colors, name = NULL) +
+    scale_shape_manual(values = index_shapes, name = NULL) +
+    scale_x_log10(labels = scales::comma) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    facet_grid(working_model ~ analysis_model,
+               labeller = labeller(working_model = function(x) paste("Working:", x),
+                                   analysis_model = function(x) paste("Analysis:", x))) +
+    labs(title = paste0(m, ": flagging rate by ", tolower(x_lab)),
+         x = x_lab, y = "Flagging rate", caption = flag_caption) +
+    theme(plot.caption = element_text(hjust = 0, color = "#52514e", size = 8))
+}
 ```
 
 ```{r}
 #| label: flag-by-length
 #| fig-width: 9.5
-#| fig-height: 9
+#| fig-height: 7.5
 
-flags |>
-  filter(Method == "Normal theory") |>
-  ggplot(aes(x = n_items, y = Rate, color = working_model)) +
-  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
-  geom_point(size = 1.9, alpha = 0.85) +
-  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x, se = FALSE,
-              color = "#0b0b0b", linewidth = 0.5) +
-  scale_color_manual(values = model_colors, name = "Working model") +
-  scale_x_log10() +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
-  labs(
-    title = "Normal-theory flagging rate by test length",
-    subtitle = "Rows = index, columns = analysis model, color = table's working model. Dashed line = nominal alpha.",
-    x = "Number of items (log scale)", y = "Flagged"
-  )
+plot_flags(n_items, "Normal theory", "Test length (log scale)")
 ```
 
 ```{r}
 #| label: flag-by-n
 #| fig-width: 9.5
-#| fig-height: 9
+#| fig-height: 7.5
 
-flags |>
-  filter(Method == "Normal theory") |>
-  ggplot(aes(x = n_persons, y = Rate, color = working_model)) +
-  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
-  geom_point(size = 1.9, alpha = 0.85) +
-  geom_smooth(aes(group = 1), method = "lm", formula = y ~ x, se = FALSE,
-              color = "#0b0b0b", linewidth = 0.5) +
-  scale_color_manual(values = model_colors, name = "Working model") +
-  scale_x_log10(labels = scales::comma) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
-  labs(
-    title = "Normal-theory flagging rate by sample size",
-    subtitle = "Rows = index, columns = analysis model, color = table's working model. Dashed line = nominal alpha.",
-    x = "Number of persons (log scale)", y = "Flagged"
-  )
+plot_flags(n_persons, "Normal theory", "Sample size (log scale)")
 ```
 
 ```{r}
@@ -327,7 +353,7 @@ Pooled over tables, analysis models and indices, the median normal-theory flaggi
 - **Index.** lz\* is above $\alpha$ for every table and model (minimum `r pct(nt_by_index$min[nt_by_index$Index == "lz*"])`). ECI_Z2\* is the only index usually *below* it (median `r pct(nt_by_index$med[nt_by_index$Index == "ECI_Z2*"])`).
 - **Analysis model.** Scoring under the 1PL flags the most (median `r pct(nt_by_model$med[nt_by_model$Analysis_model == "1PL"])`, against `r pct(nt_by_model$med[nt_by_model$Analysis_model == "2PL"])` for the 2PL and `r pct(nt_by_model$med[nt_by_model$Analysis_model == "3PL"])` for the 3PL).
 - **Sample size.** No consistent relationship. Across-table correlations with log N range from `r sprintf('%.2f', min(cells$r_n))` to `r sprintf('%.2f', max(cells$r_n))` over the 15 index × analysis-model cells, mostly weakly negative.
-- **Test length.** Longer tests appear to flag more: the correlation with log(items) is positive in `r sum(cells$r_items > 0)` of 15 cells. But this rests on the `r nrow(long_tables)` tables with 40+ items (`r paste0("\x60", long_tables$dataset, "\x60", collapse = ", ")`). Without them, the correlations shrink to between `r sprintf('%.2f', min(cells$r_items_short))` and `r sprintf('%.2f', max(cells$r_items_short))`. Neither long table's working model fits acceptably, so test length and model misfit cannot be separated here.
+- **Test length.** Longer tests appear to flag more: the correlation with log(items) is positive in `r sum(cells$r_items > 0)` of 15 cells. But this rests on the `r nrow(long_tables)` tables with 40+ items (`r paste0("\x60", long_tables$dataset, "\x60", collapse = ", ")`). Without them, the correlations shrink to between `r sprintf('%.2f', min(cells$r_items_short))` and `r sprintf('%.2f', max(cells$r_items_short))`. Neither long table's working model fits acceptably, so test length and model misfit cannot be separated here. The faceted figures make the same point differently: the 56-item table sits in the 3PL-working row on its own, so the rise across that row rests on a single table.
 - **Absolute fit.** Tables whose working model fails the RMSEA/SRMSR criteria flag more (median `r pct(nt_fit$med[!nt_fit$working_acceptable_fit])` against `r pct(nt_fit$med[nt_fit$working_acceptable_fit])`). This is the first sign of a theme that recurs in Section 5.
 
 ## 4. Bootstrap critical values and reflagging
@@ -420,25 +446,46 @@ kable(null_summary, digits = 3, caption = "Null flagging rate across all table �
 
 ### 4c. Observed flagging after reflagging
 
-```{r}
-#| label: reflag-plot
-#| fig-width: 9.5
-#| fig-height: 9
+The same template is repeated once per method, so the three cutoffs can be compared panel by panel. The normal-theory figure repeats the one in Section 3.
 
-flags |>
-  ggplot(aes(x = n_items, y = Rate, color = Method)) +
-  geom_hline(yintercept = alpha, linetype = "dashed", color = "#52514e") +
-  geom_point(size = 1.5, alpha = 0.75) +
-  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.6) +
-  scale_color_manual(values = method_colors) +
-  scale_x_log10() +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-  facet_grid(Index ~ Analysis_model, labeller = labeller(Analysis_model = function(x) paste("Analysis:", x))) +
-  labs(
-    title = "Observed flagging rate by method, as a function of test length",
-    subtitle = "Rows = index, columns = analysis model. Dashed line = nominal alpha.",
-    x = "Number of items (log scale)", y = "Flagged"
-  )
+```{r}
+#| label: reflag-plot-normal
+#| fig-width: 9.5
+#| fig-height: 7.5
+
+plot_flags(n_items, "Normal theory", "Test length (log scale)")
+```
+
+```{r}
+#| label: reflag-plot-boot
+#| fig-width: 9.5
+#| fig-height: 7.5
+
+plot_flags(n_items, "Bootstrap", "Test length (log scale)")
+```
+
+```{r}
+#| label: reflag-plot-boot-ability
+#| fig-width: 9.5
+#| fig-height: 7.5
+
+plot_flags(n_items, "Bootstrap by ability", "Test length (log scale)")
+```
+
+```{r}
+#| label: reflag-plot-boot-n
+#| fig-width: 9.5
+#| fig-height: 7.5
+
+plot_flags(n_persons, "Bootstrap", "Sample size (log scale)")
+```
+
+```{r}
+#| label: reflag-plot-boot-ability-n
+#| fig-width: 9.5
+#| fig-height: 7.5
+
+plot_flags(n_persons, "Bootstrap by ability", "Sample size (log scale)")
 ```
 
 ```{r}

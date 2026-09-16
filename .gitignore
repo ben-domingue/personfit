@@ -30,5 +30,6 @@ Thumbs.db
 
 # Raw computed outputs (rds caches, per-dataset CSVs) — regenerate from compute scripts
 persondata/
-persondata_v2/
+persondata_v2/*
+!persondata_v2/flag_results.csv
 archive_*/persondata*/
